@@ -1,0 +1,30 @@
+[project]
+name = "pulsar"
+version = "0.0.0"
+description = "Python authoring layer for pulsar: stateless module compositions over hand-written CUDA custom-op kernels."
+# Pinned to 3.13: PyTorch has no CUDA wheels for Python 3.14 yet.
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "fastapi>=0.115",
+    "numpy>=2.5.1",
+    "safetensors>=0.8.0",
+    "tokenizers>=0.23.1",
+    "torch>=2.13.0",
+    "xdg-base-dirs>=6.0.2",
+]
+
+[build-system]
+requires = ["scikit-build-core", "torch"]
+build-backend = "scikit_build_core.build"
+
+[tool.scikit-build]
+cmake.version = ">=3.26"
+wheel.packages = ["src/pulsar"]
+build.targets = ["pulsar_core_bindings"]
+install.components = ["python"]
+
+[tool.scikit-build.cmake.define]
+CMAKE_CUDA_ARCHITECTURES = "native"
+
+[tool.uv.extra-build-dependencies]
+pulsar = [{ requirement = "torch", match-runtime = true }]

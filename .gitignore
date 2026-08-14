@@ -1,0 +1,15 @@
+/.venv/
+/build/
+/dist/
+/data/
+/scratch/
+/tmp/
+
+/.pytest_cache/
+/.ruff_cache/
+
+/compile_commands.json
+/pyrightconfig.json
+/.clangd
+
+__pycache__/

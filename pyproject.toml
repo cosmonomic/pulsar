@@ -1,0 +1,19 @@
+[project]
+name = "project-pulsar"
+version = "0.0.0"
+requires-python = ">=3.13,<3.14"
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["pulsar"]
+
+[dependency-groups]
+dev = ["pulsar", "pytest", "ruff", "ty"]
+
+[tool.uv.sources]
+pulsar = { workspace = true }
+
+[tool.pytest.ini_options]
+testpaths = ["pulsar/tests"]
