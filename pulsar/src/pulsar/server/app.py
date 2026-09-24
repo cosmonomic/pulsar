@@ -1,5 +1,5 @@
 import os
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
@@ -22,7 +22,7 @@ _PAGE_SIZE = 16  # the tensor-core paged attention kernel requires 16 or 32
 @dataclass
 class Settings:
     model: str
-    device: str = "cuda:0"
+    device: torch.device = torch.device("cuda")
     dtype: torch.dtype = torch.bfloat16
     active_buffer_size: int = 32768
     max_chunk_size: int = 256
@@ -35,7 +35,7 @@ class Settings:
             raise RuntimeError("PULSAR_MODEL must be set")
         return cls(
             model=model,
-            device=os.environ.get("PULSAR_DEVICE", cls.device),
+            device=torch.device(os.environ.get("PULSAR_DEVICE", cls.device)),
             dtype=_DTYPES[os.environ.get("PULSAR_DTYPE", "bfloat16")],
             active_buffer_size=int(
                 os.environ.get("PULSAR_ACTIVE_BUFFER_SIZE", cls.active_buffer_size)
@@ -80,27 +80,24 @@ def _load_pulsar(settings: Settings) -> Pulsar:
     )
 
 
-def build_app(build_state: Callable[[], ServerState]) -> FastAPI:
-    @asynccontextmanager
-    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        state = build_state()
-        app.state.server = state
-        try:
-            yield
-        finally:
-            await state.pulsar.aclose()
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    settings = Settings.from_env()
 
-    app = FastAPI(lifespan=lifespan)
-    app.include_router(openai_router, prefix="/api/openai/v1")
-    return app
+    app.state.pulsar = _load_pulsar(settings)
 
+    app.state.server_state = ServerState(
+        app.state.pulsar,
+        settings.model,
+        settings.max_sessions,
+    )
 
-def create_app() -> FastAPI:
-    def build_state() -> ServerState:
-        settings = Settings.from_env()
-        return ServerState(_load_pulsar(settings), settings.model, settings.max_sessions)
-
-    return build_app(build_state)
+    try:
+        yield
+    finally:
+        await app.state.pulsar.aclose()
 
 
-app = create_app()
+app = FastAPI(lifespan=lifespan)
+
+app.include_router(openai_router, prefix="/api/openai/v1")

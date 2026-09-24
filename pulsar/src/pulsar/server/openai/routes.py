@@ -1,13 +1,35 @@
+# TODO: refactor. the openai api endpoint should
+# map conversation history to a session_id,
+# see pulsar.conversation
+#
+# we naively don't fork / cache prefixes.
+# we keep a tree of history digests
+# where digest(message_t, message_{t-1}..message_0) = combine(message_t, digest(message_{t-2}..message_0))
+# for a history of messages t=0..N.
+# Note that history can have the same prefix messages.
+# We store a mapping digest to list[session_id].
+# For requests, we compute the digest of messages t-1 to 0
+# and check in the mapping if there is a session there;
+# if yes, continue the session.
+# if no, walk up the tree until we find a conversation, then fork it (and adding to the list of session_ids at that digest mapping entry)
+# Meaning that sessions are continued only if its incremented with a single turn,
+# otherwise it is forked and prefilled until up to date.
+#
+# This also means that user's agent might be using a session A for some turns,
+# and due to forking, ends up using session B at a later time. But this is fine,
+# since forking should make it so that A and B are indistinguishable.
+# Thus session is not shown to the user.
+# The native API users will get token that maps to the most recent digest of the conversation,
+# which is used to retrieve a session that can fulfill the user's request.
 import functools
 import sys
 import time
 import uuid
 from collections.abc import AsyncIterator
-from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, Annotated
 
-from fastapi import HTTPException, Request
+from fastapi import HTTPException, Request, Depends
 from fastapi.responses import StreamingResponse
 from fastapi.routing import APIRouter
 
@@ -17,7 +39,7 @@ from pulsar.conversation import (
     StoredConversation,
     TruncatedError,
 )
-from pulsar.rt import Pulsar
+from pulsar.server.dependencies import Pulsar
 from pulsar.server.openai.schema import (
     ChatCompletionChoice,
     ChatCompletionChunk,
@@ -50,42 +72,39 @@ class ServerState:
             ),
         )
 
+def get_server_state(request: Request) -> ServerState:
+    return request.app.state.server_state
+
+type State = Annotated[ServerState, Depends(get_server_state)]
+
 
 router = APIRouter()
 
 
 @router.get("/models")
-async def list_models(request: Request) -> ModelList:
-    state: ServerState = request.app.state.server
+async def list_models(state: State) -> ModelList:
     return ModelList(data=[ModelCard(id=state.model_id, created=int(time.time()))])
 
 
 @router.post("/chat/completions")
-async def create_chat_completion(body: ChatCompletionRequest, request: Request):
-    state: ServerState = request.app.state.server
+async def create_chat_completion(body: ChatCompletionRequest, state: State):
     if body.model != state.model_id:
-        raise HTTPException(404, f"model {body.model!r} not found")
+        raise HTTPException(404, f"model {body.model!r} not found, only {state.model_id} is loaded")
     if not body.messages:
         raise HTTPException(422, "messages must be non-empty")
 
-    async with AsyncExitStack() as stack:
-        conversation, prompt_tokens = await stack.enter_async_context(
-            _prefill(state, body.messages)
-        )
-        max_tokens = sys.maxsize if body.max_tokens is None else body.max_tokens
+    conversation, prompt_tokens = await _prefill(state, body.messages)
+    max_tokens = sys.maxsize if body.max_tokens is None else body.max_tokens
 
-        if body.stream:
-            return await _stream_completion(
-                body, conversation, max_tokens, stack.pop_all()
-            )
+    if body.stream:
+        return await _stream_completion(body, conversation, max_tokens)
 
-        return await _full_completion(body, conversation, max_tokens, prompt_tokens)
+    return await _full_completion(body, conversation, max_tokens, prompt_tokens)
 
 
-@asynccontextmanager
 async def _prefill(
     state: ServerState, messages: list[ChatMessage]
-) -> AsyncIterator[tuple[StoredConversation, int]]:
+) -> tuple[StoredConversation, int]:
     *prefix, last = messages
 
     with state.conversations.claim_by_history(
@@ -97,7 +116,7 @@ async def _prefill(
             rest = [last]
             for m in rest:
                 prompt_tokens += await conversation.send(m.role, m.content)
-            yield conversation, prompt_tokens
+            return conversation, prompt_tokens
         else:
             first, *rest = messages
             if first.role == "system":
@@ -111,7 +130,7 @@ async def _prefill(
             ):
                 for m in rest:
                     prompt_tokens += await conversation.send(m.role, m.content)
-                yield conversation, prompt_tokens
+                return conversation, prompt_tokens
 
 
 async def _full_completion(
@@ -150,7 +169,6 @@ async def _stream_completion(
     body: ChatCompletionRequest,
     conversation: StoredConversation,
     max_tokens: int,
-    stack: AsyncExitStack,
 ) -> StreamingResponse:
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
@@ -170,18 +188,17 @@ async def _stream_completion(
         return f"data: {payload.model_dump_json()}\n\n"
 
     async def events() -> AsyncIterator[str]:
-        async with stack:
-            yield chunk(ChatCompletionChunkDelta(role="assistant"))
+        yield chunk(ChatCompletionChunkDelta(role="assistant"))
 
-            finish_reason: Literal["stop", "length"] = "stop"
-            try:
-                async for text in conversation.recv(max_tokens):
-                    if text:
-                        yield chunk(ChatCompletionChunkDelta(content=text))
-            except TruncatedError:
-                finish_reason = "length"
+        finish_reason: Literal["stop", "length"] = "stop"
+        try:
+            async for text in conversation.recv(max_tokens):
+                if text:
+                    yield chunk(ChatCompletionChunkDelta(content=text))
+        except TruncatedError:
+            finish_reason = "length"
 
-            yield chunk(ChatCompletionChunkDelta(), finish_reason)
-            yield "data: [DONE]\n\n"
+        yield chunk(ChatCompletionChunkDelta(), finish_reason)
+        yield "data: [DONE]\n\n"
 
     return StreamingResponse(events(), media_type="text/event-stream")

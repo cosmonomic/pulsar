@@ -134,6 +134,8 @@ class ChatMLConversation(Conversation):
 type ConversationFactory = Callable[[str], Awaitable[tuple[int, Conversation]]]
 
 
+# TODO: refactor. conversation_id should be first class.
+# see pulsar.server.openai
 class HistoryDigest:
     """Chains a per-conversation digest of (role, content) turns and indexes
     conversations by that digest, so a caller holding only a message history
@@ -196,6 +198,7 @@ class HistoryDigest:
         self._digests[conversation_id] = digest
 
 
+# TODO: move to pulsar.server.openai
 class ConversationStore:
     """Caches active Conversations by an opaque conversation_id.
 

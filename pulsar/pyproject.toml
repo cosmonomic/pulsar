@@ -25,6 +25,3 @@ install.components = ["python"]
 
 [tool.scikit-build.cmake.define]
 CMAKE_CUDA_ARCHITECTURES = "native"
-
-[tool.uv.extra-build-dependencies]
-pulsar = [{ requirement = "torch", match-runtime = true }]
