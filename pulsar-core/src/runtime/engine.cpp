@@ -395,6 +395,9 @@ void Engine::feed(int64_t seq_id, c10::List<int64_t> tokens) {
         // waiting means this is the session's first feed since create_session() (which
         // does not schedule it); otherwise a still-pending prior feed already did.
         TORCH_CHECK(!this->sched->is_running(seq_id), "feed: seq ", seq_id, " has started prefill; cannot extend");
+        if (tokens.size() == 0) {
+            return;
+        }
         const int64_t added = static_cast<int64_t>(tokens.size());
         for (size_t i = 0; i < tokens.size(); ++i) {
             st.pending.push_back(tokens.get(i));

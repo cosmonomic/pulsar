@@ -74,24 +74,34 @@ class Conversation(ABC):
         await self._session.send(tokens)
         return len(tokens)
 
+    async def _switch_turn(self, role: Role, collapse_turn: bool = False) -> int:
+        if collapse_turn and role == self._turn:
+            return 0
+
+        tokens = 0
+
+        if self._turn is not None:
+            tokens += await self._feed(self.turn_close())
+
+        tokens += await self._feed(self.turn_open(role))
+        self._turn = role
+
+        return tokens
+
     async def send(
         self,
         role: Role,
         content: str,
         collapse_turn: bool = False,
     ) -> int:
-        tokens = 0
-        if role != self._turn:
-            if self._turn is not None and not collapse_turn:
-                tokens += await self._feed(self.turn_close())
-            tokens += await self._feed(self.turn_open(role))
-            self._turn = role
-        tokens += await self._feed(content)
+        tokens = await self._switch_turn(role, collapse_turn)
+        if content:
+            tokens += await self._feed(content)
         return tokens
 
     async def recv(self, max_tokens: int = sys.maxsize) -> AsyncGenerator[str]:
         # TODO implement max_tokens in engine internals
-        await self.send("assistant", "")
+        await self._switch_turn("assistant")
         stream = await self._session.recv()
 
         decoder = DecodeStream(skip_special_tokens=False)
@@ -333,12 +343,7 @@ class StoredConversation:
     Wraps (not subclasses) a Conversation so that every client-facing turn
     is recorded via HistoryDigest.update() at the point it's sent or
     received, instead of requiring a caller to remember a matching update()
-    call alongside every send()/recv(). Composition, not inheritance,
-    matters here: Conversation.recv() opens the assistant turn internally
-    with self.send("assistant", ""), and that internal call must not be
-    recorded (it's session plumbing, not a client-visible turn). Subclassing
-    Conversation would route that internal call through the override too;
-    holding the inner Conversation instead keeps it out of reach.
+    call alongside every send()/recv().
 
     Holds only the HistoryDigest, not the whole ConversationStore: it has no
     business reaching into the store's conversation_id -> Conversation cache, and

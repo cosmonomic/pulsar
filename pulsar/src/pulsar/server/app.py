@@ -22,7 +22,7 @@ _PAGE_SIZE = 16  # the tensor-core paged attention kernel requires 16 or 32
 @dataclass
 class Settings:
     model: str
-    device: torch.device = torch.device("cuda")
+    device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
     active_buffer_size: int = 32768
     max_chunk_size: int = 256
@@ -35,7 +35,7 @@ class Settings:
             raise RuntimeError("PULSAR_MODEL must be set")
         return cls(
             model=model,
-            device=torch.device(os.environ.get("PULSAR_DEVICE", cls.device)),
+            device=os.environ.get("PULSAR_DEVICE", cls.device),
             dtype=_DTYPES[os.environ.get("PULSAR_DTYPE", "bfloat16")],
             active_buffer_size=int(
                 os.environ.get("PULSAR_ACTIVE_BUFFER_SIZE", cls.active_buffer_size)
@@ -50,7 +50,7 @@ class Settings:
 def _load_pulsar(settings: Settings) -> Pulsar:
     model = checkpoint.load(
         checkpoint.model_path(settings.model),
-        device=settings.device,
+        device=torch.device(settings.device),
         dtype=settings.dtype,
     )
     cfg = model.config
