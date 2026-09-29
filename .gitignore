@@ -13,3 +13,4 @@
 /.clangd
 
 __pycache__/
+.nvim.lua

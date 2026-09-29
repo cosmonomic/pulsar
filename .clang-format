@@ -15,6 +15,7 @@ InsertBraces: true
 BinPackArguments: false
 BinPackParameters: false
 PackConstructorInitializers: Never
+ConstructorInitializerIndentWidth: 0
 AllowAllArgumentsOnNextLine: false
 AllowAllParametersOfDeclarationOnNextLine: false
 

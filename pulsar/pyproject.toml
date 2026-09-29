@@ -25,3 +25,4 @@ install.components = ["python"]
 
 [tool.scikit-build.cmake.define]
 CMAKE_CUDA_ARCHITECTURES = "native"
+CMAKE_INTERPROCEDURAL_OPTIMIZATION = "ON"

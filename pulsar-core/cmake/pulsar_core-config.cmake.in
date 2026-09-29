@@ -3,4 +3,11 @@
 include(CMakeFindDependencyMacro)
 find_dependency(Torch)
 
-include("${CMAKE_CURRENT_LIST_DIR}/pulsar_core-targets.cmake")
+if(NOT TARGET pulsar_core::pulsar_core)
+    include("${CMAKE_CURRENT_LIST_DIR}/pulsar_core-targets.cmake")
+    target_include_directories(pulsar_core::pulsar_core INTERFACE ${TORCH_INCLUDE_DIRS})
+    target_link_libraries(pulsar_core::pulsar_core INTERFACE ${TORCH_LIBRARIES})
+    # Some TORCH_LIBRARIES entries (e.g. torch, torch_library) link as bare -l flags;
+    # this gives the consumer's linker the -L to resolve them.
+    target_link_directories(pulsar_core::pulsar_core INTERFACE "${TORCH_INSTALL_PREFIX}/lib")
+endif()

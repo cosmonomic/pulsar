@@ -41,6 +41,7 @@ add_library(pulsar_core STATIC
     src/kernels/w4a16_marlin.cu
     src/kernels/rope.cu
     src/kernels/reposition.cu
+    src/ds/trie.cpp
     src/runtime/kv/active_buffer.cpp
     src/runtime/scheduler.cpp
     src/model/compiled_model.cpp
@@ -57,17 +58,16 @@ add_library(pulsar_core STATIC
     src/runtime/engine.cpp
 )
 target_compile_features(pulsar_core PUBLIC cxx_std_20 cuda_std_20)
-# TORCH_INCLUDE_DIRS explicitly, not left to TorchConfig.cmake's directory-scoped
-# include_directories(): that doesn't reach an exported target's own consumers.
 target_include_directories(pulsar_core PUBLIC
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
     "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>"
-    ${TORCH_INCLUDE_DIRS}
 )
-target_link_libraries(pulsar_core PUBLIC ${TORCH_LIBRARIES})
-# Some TORCH_LIBRARIES entries (e.g. torch, torch_library) are CMake targets that
-# export as bare -l flags; this gives a consumer's linker the -L to resolve them.
-target_link_directories(pulsar_core PUBLIC "${TORCH_INSTALL_PREFIX}/lib")
+# TORCH_INCLUDE_DIRS, TORCH_LIBRARIES and TORCH_INSTALL_PREFIX hold absolute paths into
+# this machine's torch, so they stay out of the export; pulsar_core-config.cmake attaches
+# the consumer's own.
+target_include_directories(pulsar_core PUBLIC "$<BUILD_INTERFACE:${TORCH_INCLUDE_DIRS}>")
+target_link_libraries(pulsar_core PUBLIC "$<BUILD_INTERFACE:${TORCH_LIBRARIES}>")
+target_link_directories(pulsar_core PUBLIC "$<BUILD_INTERFACE:${TORCH_INSTALL_PREFIX}/lib>")
 if(PULSAR_PROF)
     target_compile_definitions(pulsar_core PUBLIC PULSAR_PROF)
 endif()
