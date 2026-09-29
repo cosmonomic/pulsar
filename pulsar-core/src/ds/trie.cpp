@@ -84,9 +84,7 @@ void trie<std::uint64_t>::iterator::seek_root(std::size_t from) {
     }
 }
 
-trie<std::uint64_t>::iterator::iterator(
-    std::span<const intrusive_ptr<branch>> roots, std::size_t from
-) noexcept
+trie<std::uint64_t>::iterator::iterator(std::span<const intrusive_ptr<branch>> roots, std::size_t from) noexcept
 : roots(roots) {
     seek_root(from);
 }
@@ -114,9 +112,7 @@ auto trie<std::uint64_t>::iterator::operator++(int) noexcept -> iterator {
     return previous;
 }
 
-bool operator==(
-    const trie<std::uint64_t>::iterator& a, const trie<std::uint64_t>::iterator& b
-) noexcept {
+bool operator==(const trie<std::uint64_t>::iterator& a, const trie<std::uint64_t>::iterator& b) noexcept {
     return a.root == b.root && (a.root == a.roots.size() || *a == *b);
 }
 

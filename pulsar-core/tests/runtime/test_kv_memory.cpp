@@ -74,7 +74,7 @@ ActiveBuffer cpu_alloc() {
         /*n_kv_heads=*/1,
         /*n_q_heads=*/1,
         /*head_dim=*/4,
-        "float32",
+        at::kFloat,
         "cpu",
         THETA
     );

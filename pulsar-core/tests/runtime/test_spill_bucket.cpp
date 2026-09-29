@@ -217,7 +217,7 @@ TEST_CASE("PagedBucket reserve is host-only and fill copies the victim slots", "
         NKV,
         NQ,
         HD,
-        "float32",
+        at::kFloat,
         "cpu",
         /*rope_theta=*/1e6
     );

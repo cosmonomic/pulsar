@@ -57,7 +57,7 @@ ActiveBuffer make_alloc(
     int64_t head_dim = 64,
     int64_t n_layers = 1,
     int64_t n_q_heads = 0,
-    std::string dtype = "float32"
+    at::ScalarType dtype = at::kFloat
 ) {
     if (n_q_heads <= 0) {
         n_q_heads = n_kv_heads;  // group 1 unless overridden
@@ -69,7 +69,7 @@ ActiveBuffer make_alloc(
         n_kv_heads,
         n_q_heads,
         head_dim,
-        std::move(dtype),
+        dtype,
         "cuda",
         THETA
     );
@@ -2546,7 +2546,7 @@ RopeDriftRun measure_rope_drift(pulsar::PositionLayout layout, int64_t cycles) {
         head_dim,
         n_layers,
         /*n_q_heads=*/0,
-        "bfloat16"
+        at::kBFloat16
     );
 
     // Pristine pre-RoPE keys, kept host-side in fp64 and never written back.

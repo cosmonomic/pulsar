@@ -92,7 +92,7 @@ EngineConfig recall_config() {
     c.max_sessions = 2;
     c.active_buffer_size = ACTIVE_BUFFER;
     c.page_size = PAGE_SIZE;
-    c.dtype = "float32";
+    c.dtype = at::kFloat;
     c.device = "cuda";
     c.max_running = 2;
     c.max_chunk_size = MAX_CHUNK;

@@ -5,6 +5,9 @@
 /scratch/
 /tmp/
 
+/pulsar/build/
+/pulsar-core/build/
+
 /.pytest_cache/
 /.ruff_cache/
 
@@ -14,3 +17,4 @@
 
 __pycache__/
 .nvim.lua
+.xmake/
