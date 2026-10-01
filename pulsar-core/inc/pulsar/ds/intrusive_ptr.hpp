@@ -21,11 +21,13 @@ template <typename target_type> class intrusive_ptr {
     target_type* p = nullptr;
 
   public:
+    using element_type = target_type;
+
     intrusive_ptr() noexcept = default;
 
     explicit intrusive_ptr(target_type* value) noexcept
-        requires refcount_target<target_type>
     : p(value) {
+        static_assert(refcount_target<target_type>);
         if (p) {
             p->ref.fetch_add(1, std::memory_order_relaxed);
         }
@@ -37,9 +39,8 @@ template <typename target_type> class intrusive_ptr {
     intrusive_ptr(intrusive_ptr&& other) noexcept
     : p(std::exchange(other.p, nullptr)) {}
 
-    ~intrusive_ptr() noexcept
-        requires refcount_target<target_type>
-    {
+    ~intrusive_ptr() noexcept {
+        static_assert(refcount_target<target_type>);
         if (p && p->ref.fetch_sub(1, std::memory_order_acq_rel) == 1) {
             delete p;
         }
@@ -52,6 +53,10 @@ template <typename target_type> class intrusive_ptr {
     intrusive_ptr& operator=(intrusive_ptr other) noexcept {
         std::ranges::swap(*this, other);
         return *this;
+    }
+
+    target_type* get() const noexcept {
+        return p;
     }
 
     target_type* operator->() const noexcept {

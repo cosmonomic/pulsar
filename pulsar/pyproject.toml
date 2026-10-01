@@ -29,7 +29,7 @@ packages = ["src/pulsar"]
 
 [tool.hatch.build.targets.sdist.force-include]
 "../pulsar-core/xmake.lua" = "pulsar-core/xmake.lua"
-"../pulsar-core/include" = "pulsar-core/include"
+"../pulsar-core/inc" = "pulsar-core/inc"
 "../pulsar-core/src" = "pulsar-core/src"
 "../pulsar-core/tests" = "pulsar-core/tests"
 
@@ -48,6 +48,6 @@ cache-keys = [
     { file = "xmake.lua" },
     { file = "ext/**" },
     { file = "../pulsar-core/xmake.lua" },
-    { file = "../pulsar-core/include/**" },
+    { file = "../pulsar-core/inc/**" },
     { file = "../pulsar-core/src/**" },
 ]
