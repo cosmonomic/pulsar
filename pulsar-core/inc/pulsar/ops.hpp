@@ -3,7 +3,6 @@
 #include <ATen/core/Tensor.h>
 
 #include <optional>
-
 #include <tuple>
 
 // Kernel entry points. Each is registered as a torch custom op in
@@ -14,41 +13,12 @@ namespace pulsar {
 // RMSNorm. Stateless.
 at::Tensor rmsnorm_cuda(const at::Tensor& x, const at::Tensor& weight, double eps);
 
-// Fused causal attention with a per-key attention_mass side output. attention_mass
-// is threaded in and returned with this step's mass added.
-//   q          [n_q_heads, seq_q, head_dim]
-//   k, v       [n_kv_heads, L, head_dim]
-//   attention_mass [n_kv_heads, L]  (fp32; running signal, added to)
-// Returns (o [n_q_heads, seq_q, head_dim], attention_mass_out [n_kv_heads, L]).
-std::tuple<at::Tensor, at::Tensor> attn_causal_cuda(
-    const at::Tensor& q,
-    const at::Tensor& k,
-    const at::Tensor& v,
-    const at::Tensor& attention_mass,
-    double scale,
-    int64_t causal_offset
-);
-
-// Cache-form fused causal attention for the fixed-capacity KV path. k_cache and
-// v_cache are [n_kv_heads, max_len, head_dim] fixed buffers whose new K/V rows
-// are already written at [cur_len, cur_len+seq_q); only rows [0, valid_len) with
-// valid_len = cur_len + seq_q are read. attention_mass [n_kv_heads, max_len] fp32
-// is mutated in place (this step's per-key normalized mass is added into rows
-// [0, valid_len)). Returns o [n_q_heads, seq_q, head_dim].
-at::Tensor attn_causal_cache_cuda(
-    const at::Tensor& q,
-    const at::Tensor& k_cache,
-    const at::Tensor& v_cache,
-    const at::Tensor& attention_mass,
-    double scale,
-    int64_t cur_len
-);
-
 // Scatter new K/V rows into a paged pool. k_pool/v_pool are
 // [num_pages, page_size, n_kv_heads, head_dim]; k_new/v_new are
 // [num_new_tokens, n_kv_heads, head_dim]. Token t writes into
 // k_pool[slot/page_size, slot%page_size, :, :] with slot = slot_mapping[t]
-// (int32 [num_new_tokens]). Mutates k_pool/v_pool in place.
+// (int32 [num_new_tokens]). Mutates k_pool/v_pool in place. Keys are stored as given:
+// the attention ops expect them UNROTATED.
 void write_kv_cuda(
     const at::Tensor& k_pool,
     const at::Tensor& v_pool,
@@ -57,139 +27,122 @@ void write_kv_cuda(
     const at::Tensor& slot_mapping
 );
 
-// Paged decode attention with a per-key mass side output (seq_q == 1). For
-// sequence s and query head h (kv head h / (n_q_heads / n_kv_heads)), attend
-// over keys j in [0, context_lens[s]); key j lives at pool slot
-// (page_tables[s][j/page_size], j%page_size). Non-causal (the decode query
-// attends its whole context). The normalized weight scaled by the EMA gain alpha
-// is added into mass_pool[page, offset, h] via atomicAdd, into the QUERY head's
-// own column with no sum over the group. mass_pool
-// [num_pages, page_size, n_q_heads] fp32 is mutated in place. attention_mass_decay
-// is fp32 [num_seqs] on the pool device: sequence s's EMA gain alpha, the factor
-// its accumulated per-key term is scaled by (1.0 accumulates the raw weight). One
-// alpha per sequence, so sequences batched together may decay at different rates.
-// The accumulated weight is rescaled by mass_length_gain, the length its share is
-// stated against, so uniform attention over exactly that length stores 1 and the stored
-// quantity is the key's share of attention as a multiple of UNIFORM AT THAT LENGTH.
-// <= 0 takes context_lens[s], the keys the query actually attended, which the op can
-// read but a caller cannot. A caller wanting some other CONSTANT length passes 1 and
-// multiplies by it once afterwards: the mass is a sum over query tokens, so a constant
-// commutes with the accumulation and the op need not carry it.
-//   q            [num_seqs, n_q_heads, head_dim]  (already RoPE'd)
-//   k_pool,v_pool [num_pages, page_size, n_kv_heads, head_dim]
-//   page_tables int32 [num_seqs, max_pages]
-//   context_lens int32 [num_seqs]
-//   attention_mass_decay fp32 [num_seqs]
-//   mass_length_gain  TOKENS; <= 0 uses each sequence's own context length
+// Paged attention over a batch of sequences, each a VIEW: an ordered list of lanes
+// (page_size-key pages) of the shared pool. Key index j of sequence s lives at
+// (page_tables[s][j / page_size], j % page_size). A lane may appear in several views.
+//
+// The pool holds UNROTATED keys. The op rotates key j of sequence s to the RoPE
+// position rope_layout[s] gives index j, in the HF/Qwen2 rotate_half convention over
+// the full head_dim with base rope_theta. rope_layout is int32 [num_seqs, 3] holding
+// {n_sink, working_lo, short_offset}:
+//   j < n_sink                 -> j
+//   n_sink <= j < working_lo   -> short_offset
+//   j >= working_lo            -> short_offset + 1 + j - working_lo
+// so {0, 0, -1} is the identity and a compacted layout collapses the distant region
+// [n_sink, working_lo) onto short_offset. Queries arrive ALREADY rotated, by the
+// caller, to the same layout's position of their own view index.
+//
+// mass, when given, receives each attended key's normalized softmax weight, added into
+// the QUERY head's own column (no sum over the group), at the key's VIEW row:
+// sequence s's key j accumulates into mass[cu_view_pages[s] + j / page_size,
+// j % page_size, h]. Views therefore never share mass, whatever lanes they share.
+//   mass                 fp32 [total_view_pages, page_size, n_q_heads], mutated in place
+//   cu_view_pages        int32 [num_seqs + 1]; sequence s owns view pages
+//                        [cu_view_pages[s], cu_view_pages[s+1]), at least its context's
+//   attention_mass_decay fp32 [num_seqs]; sequence s's EMA gain alpha, the factor its
+//                        received weight is scaled by (1.0 accumulates the raw weight)
+//   mass_length_gain     TOKENS. Each query's weight is rescaled by the length its
+//                        share is stated against, so uniform attention over exactly
+//                        that length stores 1. <= 0 takes the keys that query attended,
+//                        which only the op can read. A caller wanting another CONSTANT
+//                        length passes 1 and multiplies once afterwards: the mass sums
+//                        over query tokens, so a constant commutes with it.
+// The three tensors are passed together or not at all; without them the op skips its
+// mass pass entirely.
+//
+// lse_capture, when given, receives each (query row, query head)'s logsumexp of
+// scale * q.k over the keys that row attended, fp32 contiguous [total_q, n_q_heads]:
+// the softmax denominator the attention used, so exp(logit - lse) is a key's weight.
+
+// Decode: one query per sequence (q [num_seqs, n_q_heads, head_dim]) attending its
+// whole view, keys [0, context_lens[s]). num_splits > 0 forces the split (flash-decode)
+// path with that many splits, 1 included; 0 picks the split count from occupancy.
 // Returns o [num_seqs, n_q_heads, head_dim].
-// lse_capture, when defined, receives this call's per-(query row, query head)
-// logsumexp of scale * q.k over the keys the row attended: fp32 contiguous
-// [num_rows, n_q_heads]. It is the softmax denominator the attention itself used, so
-// exp(logit - lse) is that key's attention weight. Undefined => not written.
 at::Tensor attn_decode_cuda(
     const at::Tensor& q,
     const at::Tensor& k_pool,
     const at::Tensor& v_pool,
-    const at::Tensor& mass_pool,
     const at::Tensor& page_tables,
     const at::Tensor& context_lens,
+    const at::Tensor& rope_layout,
+    double rope_theta,
     double scale,
-    const at::Tensor& attention_mass_decay,
+    const std::optional<at::Tensor>& mass = std::nullopt,
+    const std::optional<at::Tensor>& cu_view_pages = std::nullopt,
+    const std::optional<at::Tensor>& attention_mass_decay = std::nullopt,
+    double mass_length_gain = 0.0,
     const std::optional<at::Tensor>& lse_capture = std::nullopt,
-    double mass_length_gain = 0.0
+    int64_t num_splits = 0
 );
 
-// Scalar-only reference sibling of attn_decode: same semantics and result, always
-// the scalar kernel (never the tensor-core path).
+// attn_decode on the scalar kernel alone: the reference the tensor-core path is
+// checked against.
 at::Tensor attn_decode_scalar_cuda(
     const at::Tensor& q,
     const at::Tensor& k_pool,
     const at::Tensor& v_pool,
-    const at::Tensor& mass_pool,
     const at::Tensor& page_tables,
     const at::Tensor& context_lens,
+    const at::Tensor& rope_layout,
+    double rope_theta,
     double scale,
-    const at::Tensor& attention_mass_decay,
-    double mass_length_gain = 0.0
+    const std::optional<at::Tensor>& mass = std::nullopt,
+    const std::optional<at::Tensor>& cu_view_pages = std::nullopt,
+    const std::optional<at::Tensor>& attention_mass_decay = std::nullopt,
+    double mass_length_gain = 0.0,
+    const std::optional<at::Tensor>& lse_capture = std::nullopt
 );
 
-// Split-K (flash-decode) variant of attn_decode with the split count forced to
-// num_splits (>= 1). Same semantics and result. num_splits is consulted only on the
-// tensor-core path; the scalar fallback ignores it.
-at::Tensor attn_decode_split_cuda(
-    const at::Tensor& q,
-    const at::Tensor& k_pool,
-    const at::Tensor& v_pool,
-    const at::Tensor& mass_pool,
-    const at::Tensor& page_tables,
-    const at::Tensor& context_lens,
-    double scale,
-    int64_t num_splits,
-    const at::Tensor& attention_mass_decay,
-    const std::optional<at::Tensor>& lse_capture = std::nullopt,
-    double mass_length_gain = 0.0
-);
-
-// Paged prefill attention with a per-key mass side output (seq_q >= 1, causal,
-// varlen). The prefill counterpart of attn_decode: for a
-// ragged batch, sequence i's query tokens are q[cu_seqlens_q[i] :
-// cu_seqlens_q[i+1]] and occupy context pos [ctx_start_i, seqlens_k[i])
-// with ctx_start_i = seqlens_k[i] - seq_q_i. A query token at context pos p
-// attends to keys j in [0, p] (causal); key j lives at pool slot
-// (page_tables[i][j/page_size], j%page_size). The normalized weight is added
-// into mass_pool at each attended key's slot via atomicAdd, into the QUERY head's
-// own column with no sum over the group, summed over the query tokens with
-// p >= j. attention_mass_decay is fp32 [num_seqs] on the pool device: sequence i's
-// EMA gain alpha, the factor its accumulated per-key term is scaled by (1.0
-// accumulates the raw weight). The within-chunk retention 1 - alpha comes from the
-// same value: a query at offset o from the chunk end weighs (1 - alpha)^o. One
-// alpha per sequence, so sequences batched together may decay at different rates.
-// Each query's contribution is rescaled by mass_length_gain, the length its share is
-// stated against. <= 0 takes p + 1, that query's own CAUSAL key count, which varies
-// query by query: mass handed out early in a prefill (few keys attended, large
-// weights) is then comparable with mass handed out later, and the stored quantity is
-// the key's share of attention as a multiple of UNIFORM. A caller wanting some other
-// CONSTANT length passes 1 and multiplies by it once afterwards (see attn_decode).
-//   q            [total_q, n_q_heads, head_dim]  (already RoPE'd)
-//   k_pool,v_pool [num_pages, page_size, n_kv_heads, head_dim]
-//   mass_pool    [num_pages, page_size, n_q_heads]  fp32, per query head; UNDEFINED
-//                skips the mass pass entirely, and nothing else in the op reads it
-//   page_tables int32 [num_seqs, max_pages]
-//   cu_seqlens_q int32 [num_seqs+1]
-//   seqlens_k    int32 [num_seqs]
-//   attention_mass_decay fp32 [num_seqs]
-//   mass_length_gain  TOKENS; <= 0 uses each query's own causal key count
-// Returns o [total_q, n_q_heads, head_dim].
-// lse_capture, when defined, receives the per-(query row, query head) logsumexp over
-// the keys that row attended -- its CAUSAL prefix, so the key count varies by row --
-// as fp32 contiguous [total_q, n_q_heads]. Undefined => not written.
+// Prefill: a ragged batch of query chunks, causal over each view. Sequence i's queries
+// are q[cu_seqlens_q[i] : cu_seqlens_q[i+1]] (q [total_q, n_q_heads, head_dim]) at view
+// indices [ctx_start_i, seqlens_k[i]) with ctx_start_i = seqlens_k[i] - seq_q_i, and
+// the query at view index p attends keys [0, p]. The mass is the within-chunk EMA: the
+// query at offset o from its chunk's end contributes alpha * (1 - alpha)^o times its
+// weight. Returns o [total_q, n_q_heads, head_dim].
 at::Tensor attn_prefill_cuda(
     const at::Tensor& q,
     const at::Tensor& k_pool,
     const at::Tensor& v_pool,
-    const at::Tensor& mass_pool,
     const at::Tensor& page_tables,
     const at::Tensor& cu_seqlens_q,
     const at::Tensor& seqlens_k,
+    const at::Tensor& rope_layout,
+    double rope_theta,
     double scale,
-    const at::Tensor& attention_mass_decay,
-    const std::optional<at::Tensor>& lse_capture = std::nullopt,
-    double mass_length_gain = 0.0
+    const std::optional<at::Tensor>& mass = std::nullopt,
+    const std::optional<at::Tensor>& cu_view_pages = std::nullopt,
+    const std::optional<at::Tensor>& attention_mass_decay = std::nullopt,
+    double mass_length_gain = 0.0,
+    const std::optional<at::Tensor>& lse_capture = std::nullopt
 );
 
-// Scalar-only reference sibling of attn_prefill: same semantics and result, always
-// the scalar kernel (never the tensor-core path).
+// attn_prefill on the scalar kernel alone: the reference the tensor-core path is
+// checked against.
 at::Tensor attn_prefill_scalar_cuda(
     const at::Tensor& q,
     const at::Tensor& k_pool,
     const at::Tensor& v_pool,
-    const at::Tensor& mass_pool,
     const at::Tensor& page_tables,
     const at::Tensor& cu_seqlens_q,
     const at::Tensor& seqlens_k,
+    const at::Tensor& rope_layout,
+    double rope_theta,
     double scale,
-    const at::Tensor& attention_mass_decay,
-    double mass_length_gain = 0.0
+    const std::optional<at::Tensor>& mass = std::nullopt,
+    const std::optional<at::Tensor>& cu_view_pages = std::nullopt,
+    const std::optional<at::Tensor>& attention_mass_decay = std::nullopt,
+    double mass_length_gain = 0.0,
+    const std::optional<at::Tensor>& lse_capture = std::nullopt
 );
 
 // Fused w4a16 dequant-GEMM: y = x @ dequant(W)^T for a Linear with group-wise

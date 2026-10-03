@@ -26,29 +26,6 @@ def _reposition_kv_fake(
     return None
 
 
-def _attn_causal_fake(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    attention_mass: torch.Tensor,
-    scale: float,
-    causal_offset: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return torch.empty_like(q), torch.empty_like(attention_mass)
-
-
-def _attn_causal_cache_fake(
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    attention_mass: torch.Tensor,
-    scale: float,
-    cur_len: int,
-) -> torch.Tensor:
-    # attention_mass is mutated in place (Tensor(a!)); the op returns only o.
-    return torch.empty_like(q)
-
-
 def _write_kv_fake(
     k_pool: torch.Tensor,
     v_pool: torch.Tensor,
@@ -64,15 +41,19 @@ def _attn_decode_fake(
     q: torch.Tensor,
     k_pool: torch.Tensor,
     v_pool: torch.Tensor,
-    mass_pool: torch.Tensor,
     page_tables: torch.Tensor,
     context_lens: torch.Tensor,
+    rope_layout: torch.Tensor,
+    rope_theta: float,
     scale: float,
-    attention_mass_decay: torch.Tensor,
-    lse_capture: torch.Tensor | None = None,
+    mass: torch.Tensor | None = None,
+    cu_view_pages: torch.Tensor | None = None,
+    attention_mass_decay: torch.Tensor | None = None,
     mass_length_gain: float = 0.0,
+    lse_capture: torch.Tensor | None = None,
+    num_splits: int = 0,
 ) -> torch.Tensor:
-    # mass_pool/lse_capture are mutated in place; the op returns only o.
+    # mass/lse_capture are mutated in place; the op returns only o.
     return torch.empty_like(q)
 
 
@@ -80,31 +61,17 @@ def _attn_decode_scalar_fake(
     q: torch.Tensor,
     k_pool: torch.Tensor,
     v_pool: torch.Tensor,
-    mass_pool: torch.Tensor,
     page_tables: torch.Tensor,
     context_lens: torch.Tensor,
+    rope_layout: torch.Tensor,
+    rope_theta: float,
     scale: float,
-    attention_mass_decay: torch.Tensor,
+    mass: torch.Tensor | None = None,
+    cu_view_pages: torch.Tensor | None = None,
+    attention_mass_decay: torch.Tensor | None = None,
     mass_length_gain: float = 0.0,
-) -> torch.Tensor:
-    # mass_pool is mutated in place; the op returns only o.
-    return torch.empty_like(q)
-
-
-def _attn_decode_split_fake(
-    q: torch.Tensor,
-    k_pool: torch.Tensor,
-    v_pool: torch.Tensor,
-    mass_pool: torch.Tensor,
-    page_tables: torch.Tensor,
-    context_lens: torch.Tensor,
-    scale: float,
-    num_splits: int,
-    attention_mass_decay: torch.Tensor,
     lse_capture: torch.Tensor | None = None,
-    mass_length_gain: float = 0.0,
 ) -> torch.Tensor:
-    # mass_pool/lse_capture are mutated in place; the op returns only o.
     return torch.empty_like(q)
 
 
@@ -112,16 +79,19 @@ def _attn_prefill_fake(
     q: torch.Tensor,
     k_pool: torch.Tensor,
     v_pool: torch.Tensor,
-    mass_pool: torch.Tensor,
     page_tables: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     seqlens_k: torch.Tensor,
+    rope_layout: torch.Tensor,
+    rope_theta: float,
     scale: float,
-    attention_mass_decay: torch.Tensor,
-    lse_capture: torch.Tensor | None = None,
+    mass: torch.Tensor | None = None,
+    cu_view_pages: torch.Tensor | None = None,
+    attention_mass_decay: torch.Tensor | None = None,
     mass_length_gain: float = 0.0,
+    lse_capture: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    # mass_pool/lse_capture are mutated in place; the op returns only o.
+    # mass/lse_capture are mutated in place; the op returns only o.
     return torch.empty_like(q)
 
 
@@ -129,15 +99,18 @@ def _attn_prefill_scalar_fake(
     q: torch.Tensor,
     k_pool: torch.Tensor,
     v_pool: torch.Tensor,
-    mass_pool: torch.Tensor,
     page_tables: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     seqlens_k: torch.Tensor,
+    rope_layout: torch.Tensor,
+    rope_theta: float,
     scale: float,
-    attention_mass_decay: torch.Tensor,
+    mass: torch.Tensor | None = None,
+    cu_view_pages: torch.Tensor | None = None,
+    attention_mass_decay: torch.Tensor | None = None,
     mass_length_gain: float = 0.0,
+    lse_capture: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    # mass_pool is mutated in place; the op returns only o.
     return torch.empty_like(q)
 
 
@@ -203,15 +176,11 @@ def _register_fakes() -> None:
         "pulsar::rmsnorm": _rmsnorm_fake,
         "pulsar::rope": _rope_fake,
         "pulsar::reposition_kv": _reposition_kv_fake,
-        "pulsar::attn_causal": _attn_causal_fake,
-        "pulsar::attn_causal_cache": _attn_causal_cache_fake,
         "pulsar::write_kv": _write_kv_fake,
         "pulsar::attn_decode": _attn_decode_fake,
-        # _scalar/_split are internal validation seams (scalar oracle, forced
-        # split), registered here for tests; pulsar.ops has no public wrapper
-        # for either.
+        # The _scalar ops are the validation seam (scalar oracle), registered here
+        # for tests; pulsar.ops has no public wrapper for them.
         "pulsar::attn_decode_scalar": _attn_decode_scalar_fake,
-        "pulsar::attn_decode_split": _attn_decode_split_fake,
         "pulsar::attn_prefill": _attn_prefill_fake,
         "pulsar::attn_prefill_scalar": _attn_prefill_scalar_fake,
         "pulsar::gemm_w4a16": _gemm_w4a16_fake,
@@ -231,68 +200,6 @@ def rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     return torch.ops.pulsar.rmsnorm(x, weight, eps)
 
 
-def attn_causal(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    attention_mass: torch.Tensor,
-    scale: float,
-    causal_offset: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused causal attention with a per-key attention_mass side output.
-
-    Args:
-        q: Query tokens for this step, [n_q_heads, seq_q, head_dim].
-        k: Key cache slice, [n_kv_heads, L, head_dim].
-        v: Value cache slice, [n_kv_heads, L, head_dim].
-        attention_mass: Running per-key signal, [n_kv_heads, L], fp32. Added to.
-        scale: Softmax scale; softmax(scale * q @ k^T).
-        causal_offset: Pos of the first query row. Query row i may
-            attend to key j iff j <= causal_offset + i.
-
-    Returns:
-        (o, attention_mass_out) where o is [n_q_heads, seq_q, head_dim] and
-        attention_mass_out is attention_mass plus the normalized attention mass each key
-        received this step (summed over the query heads and rows sharing it).
-    """
-    return torch.ops.pulsar.attn_causal(q, k, v, attention_mass, scale, causal_offset)
-
-
-def attn_causal_cache(
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    attention_mass: torch.Tensor,
-    scale: float,
-    cur_len: int,
-) -> torch.Tensor:
-    """Cache-form fused causal attention over fixed-capacity KV buffers.
-
-    The new tokens' K/V are already written into k_cache/v_cache at rows
-    [cur_len, cur_len + seq_q) before this call. Only rows [0, valid_len) with
-    valid_len = cur_len + seq_q are read; capacity beyond valid_len may hold
-    garbage and is ignored.
-
-    Args:
-        q: Query tokens for this step, [n_q_heads, seq_q, head_dim].
-        k_cache: Fixed-capacity key buffer, [n_kv_heads, max_len, head_dim].
-        v_cache: Fixed-capacity value buffer, [n_kv_heads, max_len, head_dim].
-        attention_mass: Running per-key signal, [n_kv_heads, max_len], fp32.
-            Mutated in place: this step's normalized attention mass is added into
-            rows [0, valid_len); rows beyond valid_len are untouched.
-        scale: Softmax scale; softmax(scale * q @ k^T).
-        cur_len: Number of already-cached tokens before this step. Query row i
-            (pos cur_len + i) attends to key j iff j <= cur_len + i.
-
-    Returns:
-        o, [n_q_heads, seq_q, head_dim]. attention_mass is updated in place and
-        not returned.
-    """
-    return torch.ops.pulsar.attn_causal_cache(
-        q, k_cache, v_cache, attention_mass, scale, cur_len
-    )
-
-
 def write_kv(
     k_pool: torch.Tensor,
     v_pool: torch.Tensor,
@@ -306,7 +213,8 @@ def write_kv(
         k_pool: Key pool, [num_pages, page_size, n_kv_heads, head_dim]. Mutated
             in place.
         v_pool: Value pool, same shape as k_pool. Mutated in place.
-        k_new: New keys, [num_new_tokens, n_kv_heads, head_dim].
+        k_new: New keys, [num_new_tokens, n_kv_heads, head_dim], unrotated: the
+            attention ops rotate each key to its view position as they read it.
         v_new: New values, same shape as k_new.
         slot_mapping: int32 [num_new_tokens]. Token t is written into
             k_pool[slot/page_size, slot%page_size, :, :] with slot =
@@ -322,55 +230,68 @@ def attn_decode(
     q: torch.Tensor,
     k_pool: torch.Tensor,
     v_pool: torch.Tensor,
-    mass_pool: torch.Tensor,
     page_tables: torch.Tensor,
     context_lens: torch.Tensor,
+    rope_layout: torch.Tensor,
+    rope_theta: float,
     scale: float,
-    attention_mass_decay: torch.Tensor,
-    lse_capture: torch.Tensor | None = None,
+    mass: torch.Tensor | None = None,
+    cu_view_pages: torch.Tensor | None = None,
+    attention_mass_decay: torch.Tensor | None = None,
     mass_length_gain: float = 0.0,
+    lse_capture: torch.Tensor | None = None,
+    num_splits: int = 0,
 ) -> torch.Tensor:
-    """Paged decode attention with a per-key mass side output (seq_q == 1).
+    """Paged decode attention over per-sequence views (seq_q == 1).
 
-    Each sequence contributes one already-RoPE'd new-token query that attends
-    over its whole context (non-causal). Keys are gathered through the sequence's
-    page table.
+    Each sequence contributes one query, already rotated to its position, that
+    attends its whole view (non-causal). The op rotates every key to its view
+    position as it reads it.
 
     Args:
         q: Query tokens, [num_seqs, n_q_heads, head_dim].
-        k_pool: Key pool, [num_pages, page_size, n_kv_heads, head_dim].
+        k_pool: Key pool, [num_lanes, page_size, n_kv_heads, head_dim], UNROTATED.
         v_pool: Value pool, same shape as k_pool.
-        mass_pool: Running per-key signal, [num_pages, page_size, n_q_heads],
-            fp32. Mutated in place: this step's normalized attention mass is added
-            into the slots each sequence attends, each query head into its own
-            column (per query head, no group sum).
-        page_tables: int32 [num_seqs, max_pages]. page_tables[s][b] is the
-            physical page id of logical page b of sequence s.
-        context_lens: int32 [num_seqs]. Number of valid keys for each sequence.
+        page_tables: int32 [num_seqs, max_pages]. page_tables[s][b] is the lane
+            holding view page b of sequence s; key index j lives at
+            (page_tables[s][j // page_size], j % page_size). A lane may appear in
+            several views.
+        context_lens: int32 [num_seqs]. Number of keys in each view.
+        rope_layout: int32 [num_seqs, 3], {n_sink, working_lo, short_offset} per
+            sequence. Key index j is rotated to j below n_sink, to short_offset below
+            working_lo, and to short_offset + 1 + j - working_lo from there on, so
+            {0, 0, -1} is the identity.
+        rope_theta: RoPE base the keys are rotated with (rotate_half convention).
         scale: Softmax scale; softmax(scale * q @ k^T).
-        attention_mass_decay: fp32 [num_seqs] on the pool device. Sequence s's EMA
-            gain alpha, the factor its per-key mass term is scaled by; 1.0
-            accumulates the raw normalized weight. One entry per sequence, so
-            sequences batched together may decay at different rates. Each key's mass
-            is scaled by the length it is stated against, so the stored quantity is a
-            multiple of a uniform share over that length.
-        lse_capture: fp32 contiguous [num_seqs, n_q_heads], written in place with
-            each row's logsumexp of scale * q @ k^T over the keys it attended (the
-            softmax denominator the attention used). None leaves it unwritten.
-        mass_length_gain: TOKENS. The length each key's mass is stated against, so
-            uniform attention over exactly that many keys stores 1. 0 or less takes
-            each sequence's own context length, which only the op can read. For any
+        mass: fp32 [total_view_pages, page_size, n_q_heads], mutated in place.
+            Sequence s's key j adds its normalized weight into row
+            (cu_view_pages[s] + j // page_size, j % page_size), each query head into
+            its own column, so views sharing a lane accumulate apart. None skips the
+            mass pass; cu_view_pages and attention_mass_decay then go unread.
+        cu_view_pages: int32 [num_seqs + 1]. Sequence s owns view pages
+            [cu_view_pages[s], cu_view_pages[s+1]), at least as many as its context
+            spans.
+        attention_mass_decay: fp32 [num_seqs]. Sequence s's EMA gain alpha, the
+            factor its per-key mass term is scaled by; 1.0 accumulates the raw
+            normalized weight.
+        mass_length_gain: TOKENS. The length each query's weight is stated against,
+            so uniform attention over exactly that many keys stores 1. 0 or less
+            takes the keys that query attended, which only the op can read. For any
             other CONSTANT length, pass 1 and multiply the result by it once
-            afterwards, since the mass sums over query tokens and a constant
-            factor commutes with that sum.
+            afterwards.
+        lse_capture: fp32 contiguous [num_seqs, n_q_heads], written in place with
+            each row's logsumexp of scale * q @ k^T over the keys it attended. None
+            leaves it unwritten.
+        num_splits: Forces the split (flash-decode) path with that many splits when
+            > 0; 0 picks the count from occupancy.
 
     Returns:
-        o, [num_seqs, n_q_heads, head_dim]. mass_pool and lse_capture are updated in
-        place and not returned.
+        o, [num_seqs, n_q_heads, head_dim].
     """
     return torch.ops.pulsar.attn_decode(
-        q, k_pool, v_pool, mass_pool, page_tables, context_lens, scale,
-        attention_mass_decay, lse_capture, mass_length_gain,
+        q, k_pool, v_pool, page_tables, context_lens, rope_layout, rope_theta, scale,
+        mass, cu_view_pages, attention_mass_decay, mass_length_gain, lse_capture,
+        num_splits,
     )
 
 
@@ -378,62 +299,70 @@ def attn_prefill(
     q: torch.Tensor,
     k_pool: torch.Tensor,
     v_pool: torch.Tensor,
-    mass_pool: torch.Tensor,
     page_tables: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     seqlens_k: torch.Tensor,
+    rope_layout: torch.Tensor,
+    rope_theta: float,
     scale: float,
-    attention_mass_decay: torch.Tensor,
-    lse_capture: torch.Tensor | None = None,
+    mass: torch.Tensor | None = None,
+    cu_view_pages: torch.Tensor | None = None,
+    attention_mass_decay: torch.Tensor | None = None,
     mass_length_gain: float = 0.0,
+    lse_capture: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Paged prefill attention with a per-key mass side output (causal, varlen).
+    """Paged prefill attention over per-sequence views (causal, varlen).
 
-    The prefill counterpart of attn_decode, with many query tokens per
-    sequence, causal-masked, over a ragged batch. Sequence i's query
-    tokens are q[cu_seqlens_q[i] : cu_seqlens_q[i+1]] and occupy context
-    pos [ctx_start_i, seqlens_k[i]) with ctx_start_i = seqlens_k[i] -
-    seq_q_i. A query token at context pos p attends to keys [0, p]
-    (inclusive), gathered through the sequence's page table.
+    Sequence i's queries are q[cu_seqlens_q[i] : cu_seqlens_q[i+1]], already rotated,
+    at view indices [ctx_start_i, seqlens_k[i]) with ctx_start_i = seqlens_k[i] -
+    seq_q_i; the query at view index p attends keys [0, p]. The op rotates every key
+    to its view position as it reads it. The mass is the within-chunk EMA: the query
+    at offset o from its chunk's end contributes alpha * (1 - alpha)**o times its
+    weight.
 
     Args:
-        q: Query tokens, [total_q, n_q_heads, head_dim] (already RoPE'd).
-        k_pool: Key pool, [num_pages, page_size, n_kv_heads, head_dim].
+        q: Query tokens, [total_q, n_q_heads, head_dim].
+        k_pool: Key pool, [num_lanes, page_size, n_kv_heads, head_dim], UNROTATED.
         v_pool: Value pool, same shape as k_pool.
-        mass_pool: Running per-key signal, [num_pages, page_size, n_q_heads],
-            fp32. Mutated in place: for each key at context pos kp and query head h,
-            the sum over that head's query tokens with p >= kp of the normalized
-            weight is added into its column (per query head, no group sum).
-        page_tables: int32 [num_seqs, max_pages]. page_tables[i][b] is the
-            physical page id of logical page b of sequence i.
+        page_tables: int32 [num_seqs, max_pages]. page_tables[s][b] is the lane
+            holding view page b of sequence s; key index j lives at
+            (page_tables[s][j // page_size], j % page_size). A lane may appear in
+            several views.
         cu_seqlens_q: int32 [num_seqs+1]. Prefix sums of per-seq query lengths.
-        seqlens_k: int32 [num_seqs]. Total context length per sequence (>= that
-            sequence's query length).
+        seqlens_k: int32 [num_seqs]. Keys in each view (>= its query length).
+        rope_layout: int32 [num_seqs, 3], {n_sink, working_lo, short_offset} per
+            sequence. Key index j is rotated to j below n_sink, to short_offset below
+            working_lo, and to short_offset + 1 + j - working_lo from there on, so
+            {0, 0, -1} is the identity.
+        rope_theta: RoPE base the keys are rotated with (rotate_half convention).
         scale: Softmax scale; softmax(scale * q @ k^T).
-        attention_mass_decay: fp32 [num_seqs] on the pool device. Sequence i's EMA
-            gain alpha, the factor its per-key mass term is scaled by; 1.0
-            accumulates the raw normalized weight. The within-chunk retention comes
-            from the same value: a query token at offset o from the chunk end
-            contributes (1 - alpha)^o. One entry per sequence, so sequences batched
-            together may decay at different rates. Each query's contribution is
-            scaled by the length it is stated against, so the stored quantity is a
-            multiple of a uniform share over that length.
+        mass: fp32 [total_view_pages, page_size, n_q_heads], mutated in place.
+            Sequence s's key j adds its normalized weight into row
+            (cu_view_pages[s] + j // page_size, j % page_size), each query head into
+            its own column, so views sharing a lane accumulate apart. None skips the
+            mass pass; cu_view_pages and attention_mass_decay then go unread.
+        cu_view_pages: int32 [num_seqs + 1]. Sequence s owns view pages
+            [cu_view_pages[s], cu_view_pages[s+1]), at least as many as its context
+            spans.
+        attention_mass_decay: fp32 [num_seqs]. Sequence s's EMA gain alpha, the
+            factor its per-key mass term is scaled by; 1.0 accumulates the raw
+            normalized weight.
+        mass_length_gain: TOKENS. The length each query's weight is stated against,
+            so uniform attention over exactly that many keys stores 1. 0 or less
+            takes the keys that query attended, which only the op can read. For any
+            other CONSTANT length, pass 1 and multiply the result by it once
+            afterwards.
         lse_capture: fp32 contiguous [total_q, n_q_heads], written in place with each
-            query row's logsumexp of scale * q @ k^T over its causal prefix, so the
-            key count varies by row. None leaves it unwritten.
-        mass_length_gain: TOKENS. The length each query's contribution is stated
-            against, so uniform attention over exactly that many keys stores 1. 0 or
-            less takes each query's own causal key count, which varies query by query
-            and only the op can read. For any other CONSTANT length, pass 1 and
-            multiply by it once afterwards.
+            query row's logsumexp of scale * q @ k^T over its causal prefix. None
+            leaves it unwritten.
 
     Returns:
-        o, [total_q, n_q_heads, head_dim]. mass_pool and lse_capture are updated in
-        place and not returned.
+        o, [total_q, n_q_heads, head_dim].
     """
     return torch.ops.pulsar.attn_prefill(
-        q, k_pool, v_pool, mass_pool, page_tables, cu_seqlens_q, seqlens_k, scale,
-        attention_mass_decay, lse_capture, mass_length_gain,
+        q, k_pool, v_pool, page_tables, cu_seqlens_q, seqlens_k, rope_layout,
+        rope_theta, scale, mass, cu_view_pages, attention_mass_decay,
+        mass_length_gain, lse_capture,
     )
 
 

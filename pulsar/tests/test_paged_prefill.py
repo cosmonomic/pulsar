@@ -1,14 +1,17 @@
 """torch.ops.pulsar.attn_prefill does causal, varlen prefill attention
-(seq_q >= 1 query tokens per sequence) over a paged KV pool gathered through
-per-sequence page tables, accumulating a per-key mass into the pool in place.
+(seq_q >= 1 query tokens per sequence) over per-sequence views of a paged KV
+pool. The pool holds unrotated keys; the op rotates each to its position under
+the sequence's RoPE layout and accumulates a per-key mass into the sequence's
+own view rows.
 
-These tests compare against a plain-PyTorch paged reference, over a ragged
-batch mixing first prefill (ctx_start == 0) and chunked prefill (ctx_start > 0,
-seqlens_k > seq_q), with query spans crossing multiple 16-row tiles and KV
-pages. For fp16/bf16, attn_prefill's tensor-core result is also checked
-against the scalar reference op per physical slot of mass_pool (not just
-aggregate error), so a wrong causal boundary or key mapping cannot hide behind
-an aggregate check.
+These tests compare against a plain-PyTorch reference that rotates the gathered
+keys with ops.rope, over a ragged batch mixing first prefill (ctx_start == 0)
+and chunked prefill (ctx_start > 0, seqlens_k > seq_q), with query spans
+crossing multiple 16-row tiles and KV pages, two views sharing a lane, and both
+the contiguous and the compacted layout. For fp16/bf16, attn_prefill's
+tensor-core result is also checked against the scalar reference op per mass
+slot (not just aggregate error), so a wrong causal boundary or key mapping
+cannot hide behind an aggregate check.
 Requires a CUDA device and the built pulsar extension.
 """
 
@@ -46,6 +49,9 @@ BATCHES = [
 ]
 
 
+THETA = 1000000.0
+
+
 def _tols(dtype):
     if dtype == torch.bfloat16:
         return dict(atol=2e-2, rtol=2e-2)
@@ -58,10 +64,30 @@ def _pages_needed(ctx, page_size):
     return (ctx + page_size - 1) // page_size
 
 
+def _layout(ctx, compacted):
+    """{n_sink, working_lo, short_offset}: the identity, or a compacted layout whose
+    distant region is the middle of the view."""
+    if not compacted:
+        return (0, 0, -1)
+    n_sink = min(4, ctx)
+    working_lo = max(n_sink, ctx - 24)
+    return (n_sink, working_lo, n_sink + 3)
+
+
+def _positions(layout, ctx):
+    n_sink, working_lo, short_offset = layout
+    return [
+        j if j < n_sink else short_offset if j < working_lo
+        else short_offset + 1 + j - working_lo
+        for j in range(ctx)
+    ]
+
+
 def _build_prefill(head_cfg, page_size, seq_specs, dtype, seed):
-    """Builds a pool and page tables with disjoint shuffled physical pages per
-    sequence, writes random K/V for all seqlens_k keys, concatenates the
-    queries, and returns per-sequence gathered logical K/V for the reference."""
+    """Builds a pool of unrotated K/V and one view per sequence over shuffled lanes,
+    and concatenates the queries. View 1 takes view 0's first lane as its own first
+    page, so the two share it at different view positions; odd sequences use the
+    compacted layout."""
     torch.manual_seed(seed)
     n_q_heads, n_kv_heads, head_dim = head_cfg
     num_seqs = len(seq_specs)
@@ -70,18 +96,27 @@ def _build_prefill(head_cfg, page_size, seq_specs, dtype, seed):
     seq_qs = [sq for (sq, _) in seq_specs]
     per_seq_pages = [_pages_needed(c, page_size) for c in ctx_lens]
     max_pages = max(per_seq_pages)
-    total_pages = sum(per_seq_pages) + 3  # a few spare pages
+    total_pages = sum(per_seq_pages) + 3  # a few spare lanes
 
     perm = torch.randperm(total_pages).tolist()
-    page_tables = torch.zeros(num_seqs, max_pages, dtype=torch.int32)
+    seq_lanes = []
     cursor = 0
-    seq_phys = []
-    for s, nb in enumerate(per_seq_pages):
-        phys = perm[cursor : cursor + nb]
+    for nb in per_seq_pages:
+        seq_lanes.append(perm[cursor : cursor + nb])
         cursor += nb
-        seq_phys.append(phys)
-        for b in range(nb):
-            page_tables[s, b] = phys[b]
+    if num_seqs > 1:
+        seq_lanes[1][0] = seq_lanes[0][0]
+    page_tables = torch.zeros(num_seqs, max_pages, dtype=torch.int32)
+    for s, lanes in enumerate(seq_lanes):
+        page_tables[s, : len(lanes)] = torch.tensor(lanes, dtype=torch.int32)
+
+    layouts = [_layout(ctx, s % 2 == 1) for s, ctx in enumerate(ctx_lens)]
+    cu_view_pages = [0]
+    for nb in per_seq_pages:
+        cu_view_pages.append(cu_view_pages[-1] + nb)
+    cu = [0]
+    for sq in seq_qs:
+        cu.append(cu[-1] + sq)
 
     k_pool = torch.randn(
         total_pages, page_size, n_kv_heads, head_dim, device="cuda", dtype=dtype
@@ -89,151 +124,129 @@ def _build_prefill(head_cfg, page_size, seq_specs, dtype, seed):
     v_pool = torch.randn(
         total_pages, page_size, n_kv_heads, head_dim, device="cuda", dtype=dtype
     )
-
-    ref_k, ref_v = [], []
-    for s, ctx in enumerate(ctx_lens):
-        ks = torch.empty(ctx, n_kv_heads, head_dim, device="cuda", dtype=dtype)
-        vs = torch.empty(ctx, n_kv_heads, head_dim, device="cuda", dtype=dtype)
-        for j in range(ctx):
-            phys = seq_phys[s][j // page_size]
-            off = j % page_size
-            ks[j] = k_pool[phys, off]
-            vs[j] = v_pool[phys, off]
-        ref_k.append(ks)
-        ref_v.append(vs)
-
-    total_q = sum(seq_qs)
-    q = torch.randn(total_q, n_q_heads, head_dim, device="cuda", dtype=dtype)
-    cu = [0]
-    for sq in seq_qs:
-        cu.append(cu[-1] + sq)
-    cu_seqlens_q = torch.tensor(cu, dtype=torch.int32, device="cuda")
-    seqlens_k = torch.tensor(ctx_lens, dtype=torch.int32, device="cuda")
-    page_tables = page_tables.to("cuda")
-    return (
-        q,
-        k_pool,
-        v_pool,
-        page_tables,
-        cu_seqlens_q,
-        seqlens_k,
-        seq_phys,
-        ref_k,
-        ref_v,
+    q = torch.randn(cu[-1], n_q_heads, head_dim, device="cuda", dtype=dtype)
+    return dict(
+        q=q,
+        k_pool=k_pool,
+        v_pool=v_pool,
+        page_tables=page_tables.to("cuda"),
+        cu_seqlens_q=torch.tensor(cu, dtype=torch.int32, device="cuda"),
+        seqlens_k=torch.tensor(ctx_lens, dtype=torch.int32, device="cuda"),
+        rope_layout=torch.tensor(layouts, dtype=torch.int32, device="cuda"),
+        cu_view_pages=torch.tensor(cu_view_pages, dtype=torch.int32, device="cuda"),
+        seq_lanes=seq_lanes,
+        layouts=layouts,
+        total_view_pages=cu_view_pages[-1],
     )
 
 
-def _reference(
-    head_cfg, page_size, seq_specs, q, cu, seq_phys, ref_k, ref_v, total_pages,
-    scale, alpha=1.0, retention=None
-):
+def _view_kv(views, s, ctx):
+    """Sequence s's keys rotated to their layout positions by ops.rope (stored back
+    in the pool dtype, as the kernels round them) and its values, both fp32
+    [ctx, n_kv_heads, head_dim]."""
+    k_pool, v_pool = views["k_pool"], views["v_pool"]
+    n_kv_heads, head_dim = k_pool.shape[2], k_pool.shape[3]
+    lanes = torch.tensor(views["seq_lanes"][s], device="cuda")
+    k = k_pool[lanes].reshape(-1, n_kv_heads, head_dim)[:ctx]
+    v = v_pool[lanes].reshape(-1, n_kv_heads, head_dim)[:ctx]
+    pos = torch.tensor(
+        _positions(views["layouts"][s], ctx), dtype=torch.int64, device="cuda"
+    )
+    k = ops.rope(k.transpose(0, 1).contiguous(), pos, THETA).transpose(0, 1)
+    return k.float(), v.float()
+
+
+def _reference(head_cfg, page_size, seq_specs, views, scale, alpha=1.0,
+               retention=None):
     """Reference mass/o. retention defaults to the 1 - alpha the op derives; pass it
     explicitly only to model a grading the op cannot produce."""
     if retention is None:
         retention = 1.0 - alpha
     n_q_heads, n_kv_heads, head_dim = head_cfg
     group = n_q_heads // n_kv_heads
-    total_q = q.size(0)
+    q = views["q"]
+    cu = views["cu_seqlens_q"].tolist()
+    cu_view_pages = views["cu_view_pages"].tolist()
 
     o_ref = torch.empty(
-        total_q, n_q_heads, head_dim, device="cuda", dtype=torch.float32
+        q.size(0), n_q_heads, head_dim, device="cuda", dtype=torch.float32
     )
     mass_ref = torch.zeros(
-        total_pages, page_size, n_q_heads, device="cuda", dtype=torch.float32
+        views["total_view_pages"], page_size, n_q_heads, device="cuda",
+        dtype=torch.float32,
     )
+    mass_rows = mass_ref.view(-1, n_q_heads)
 
     for s, (seq_q, ctx) in enumerate(seq_specs):
+        ks, vs = _view_kv(views, s, ctx)
+        first_row = cu_view_pages[s] * page_size
         ctx_start = ctx - seq_q
-        q0 = cu[s]
-        ks = ref_k[s].float()  # [ctx, n_kv_heads, head_dim]
-        vs = ref_v[s].float()
         for j in range(seq_q):
             causal_key_count = ctx_start + j + 1
-            global_q = q0 + j
+            global_q = cu[s] + j
+            # wq is the gain alpha times retention graded by offset from the chunk
+            # end (retention**0 for the last query); retention == 1 gives no grading.
+            wq = alpha * retention ** (seq_q - 1 - j)
             for h in range(n_q_heads):
                 g = h // group
-                kg = ks[:causal_key_count, g, :]  # [causal_key_count, head_dim]
-                vg = vs[:causal_key_count, g, :]
-                scores = scale * (q[global_q, h].float() @ kg.t())  # [causal_key_count]
+                kg = ks[:causal_key_count, g, :]
+                scores = scale * (kg @ q[global_q, h].float())
                 w = torch.softmax(scores, dim=0)
-                o_ref[global_q, h] = w @ vg
-                # wq is the gain alpha times retention graded by offset from the
-                # chunk end (retention**0 for the last query); retention == 1 gives
-                # no grading.
-                wq = alpha * retention ** (seq_q - 1 - j)
-                for kp in range(causal_key_count):
-                    phys = seq_phys[s][kp // page_size]
-                    off = kp % page_size
-                    mass_ref[phys, off, h] += w[kp] * wq * causal_key_count  # own column for h
+                o_ref[global_q, h] = w @ vs[:causal_key_count, g, :]
+                mass_rows[first_row : first_row + causal_key_count, h] += (
+                    w * wq * causal_key_count
+                )
     return o_ref, mass_ref
 
 
+def _prefill(views, scale, mass, decay, op=None, **kwargs):
+    op = op or ops.attn_prefill
+    return op(
+        views["q"], views["k_pool"], views["v_pool"], views["page_tables"],
+        views["cu_seqlens_q"], views["seqlens_k"], views["rope_layout"], THETA, scale,
+        mass, views["cu_view_pages"], decay, **kwargs,
+    )
+
+
+def _new_mass(views, page_size, n_q_heads):
+    return torch.zeros(
+        views["total_view_pages"], page_size, n_q_heads, device="cuda",
+        dtype=torch.float32,
+    )
+
+
 def _check_prefill(head_cfg, page_size, seq_specs, dtype):
-    (
-        q,
-        k_pool,
-        v_pool,
-        page_tables,
-        cu_seqlens_q,
-        seqlens_k,
-        seq_phys,
-        ref_k,
-        ref_v,
-    ) = _build_prefill(head_cfg, page_size, seq_specs, dtype, seed=1)
-    total_pages = k_pool.size(0)
+    views = _build_prefill(head_cfg, page_size, seq_specs, dtype, seed=1)
     head_dim = head_cfg[2]
     scale = 1.0 / (head_dim**0.5)
 
-    # ops.attn_prefill runs the tensor-core kernel for fp16/bf16, scalar for fp32.
-    # Mass is per query head (head_cfg[0]); each head writes its own column.
-    mass_pool = torch.zeros(
-        total_pages, page_size, head_cfg[0], device="cuda", dtype=torch.float32
-    )
     # One EMA gain per sequence, all at MASS_DECAY here (the per-sequence spread is
     # covered by test_prefill_mass_decay).
     decay = torch.full(
         (len(seq_specs),), MASS_DECAY, device="cuda", dtype=torch.float32
     )
-    o = ops.attn_prefill(
-        q, k_pool, v_pool, mass_pool, page_tables, cu_seqlens_q, seqlens_k, scale,
-        decay,
+    # ops.attn_prefill runs the tensor-core kernel for fp16/bf16, scalar for fp32.
+    mass = _new_mass(views, page_size, head_cfg[0])
+    o = _prefill(views, scale, mass, decay)
+    mass_scalar = _new_mass(views, page_size, head_cfg[0])
+    o_scalar = _prefill(
+        views, scale, mass_scalar, decay, op=torch.ops.pulsar.attn_prefill_scalar
     )
-
-    # Scalar oracle op on the same inputs (fresh mass pool).
-    mass_scalar = torch.zeros_like(mass_pool)
-    o_scalar = torch.ops.pulsar.attn_prefill_scalar(
-        q, k_pool, v_pool, mass_scalar, page_tables, cu_seqlens_q, seqlens_k, scale,
-        decay,
-    )
-
-    cu = cu_seqlens_q.tolist()
     o_ref, mass_ref = _reference(
-        head_cfg,
-        page_size,
-        seq_specs,
-        q,
-        cu,
-        seq_phys,
-        ref_k,
-        ref_v,
-        total_pages,
-        scale,
-        alpha=MASS_DECAY,
+        head_cfg, page_size, seq_specs, views, scale, alpha=MASS_DECAY
     )
 
     tols = _tols(dtype)
     o_err = (o.float() - o_ref).abs().max().item()
-    m_err = (mass_pool - mass_ref).abs().max().item()
-    o_ok = torch.allclose(o.float(), o_ref, atol=tols["atol"], rtol=tols["rtol"])
-    m_ok = torch.allclose(mass_pool, mass_ref, atol=1e-3, rtol=1e-3)
+    m_err = (mass - mass_ref).abs().max().item()
+    o_ok = torch.allclose(o.float(), o_ref, **tols)
+    m_ok = torch.allclose(mass, mass_ref, atol=1e-3, rtol=1e-3)
 
-    # Mass compared per physical slot (both fp32) against the scalar oracle.
+    # Mass compared per slot (both fp32) against the scalar oracle.
     o_vs_scalar = (o.float() - o_scalar.float()).abs().max().item()
-    m_vs_scalar = (mass_pool - mass_scalar).abs().max().item()
-    o_sc_ok = torch.allclose(
-        o.float(), o_scalar.float(), atol=tols["atol"], rtol=tols["rtol"]
-    )
-    m_sc_ok = torch.allclose(mass_pool, mass_scalar, atol=1e-4, rtol=1e-4)
+    m_vs_scalar = (mass - mass_scalar).abs().max().item()
+    o_sc_ok = torch.allclose(o.float(), o_scalar.float(), **tols)
+    m_sc_ok = torch.allclose(mass, mass_scalar, atol=1e-4, rtol=1e-4)
 
     ok = o_ok and m_ok and o_sc_ok and m_sc_ok
     return ok, o_err, m_err, o_vs_scalar, m_vs_scalar
@@ -267,40 +280,51 @@ def test_prefill_mass_decay(dtype):
     page_size = 16
     alphas = [0.1, 0.5]
     seq_specs = [(12, 12), (12, 12)]  # two 12-query causal prefill chunks
-    (q, k_pool, v_pool, page_tables, cu_seqlens_q, seqlens_k, seq_phys, ref_k,
-     ref_v) = _build_prefill(head_cfg, page_size, seq_specs, dtype, seed=3)
-    total_pages = k_pool.size(0)
+    views = _build_prefill(head_cfg, page_size, seq_specs, dtype, seed=3)
     scale = 1.0 / (head_cfg[2] ** 0.5)
 
-    mass = torch.zeros(total_pages, page_size, head_cfg[0], device="cuda",
-                       dtype=torch.float32)
     decay = torch.tensor(alphas, device="cuda", dtype=torch.float32)
-    ops.attn_prefill(q, k_pool, v_pool, mass, page_tables, cu_seqlens_q, seqlens_k,
-                     scale, decay)
-    mass_sc = torch.zeros_like(mass)
-    torch.ops.pulsar.attn_prefill_scalar(q, k_pool, v_pool, mass_sc, page_tables,
-                                       cu_seqlens_q, seqlens_k, scale, decay)
+    mass = _new_mass(views, page_size, head_cfg[0])
+    _prefill(views, scale, mass, decay)
+    mass_sc = _new_mass(views, page_size, head_cfg[0])
+    _prefill(views, scale, mass_sc, decay, op=torch.ops.pulsar.attn_prefill_scalar)
 
-    cu = cu_seqlens_q.tolist()
     tol = 3e-3 if dtype == torch.bfloat16 else 1e-4
+    cu_view_pages = views["cu_view_pages"].tolist()
     # Each sequence is checked against a reference at its own alpha, over its own
-    # physical pages; one shared alpha would fail one of the two.
+    # view rows; one shared alpha would fail one of the two.
     for s, alpha in enumerate(alphas):
-        _, ref = _reference(head_cfg, page_size, seq_specs, q, cu, seq_phys, ref_k,
-                            ref_v, total_pages, scale, alpha=alpha)
+        _, ref = _reference(head_cfg, page_size, seq_specs, views, scale, alpha=alpha)
         # Mass with the same gain but no within-chunk grading (retention dropped).
-        _, flat = _reference(head_cfg, page_size, seq_specs, q, cu, seq_phys, ref_k,
-                             ref_v, total_pages, scale, alpha=alpha, retention=1.0)
-        pages = seq_phys[s]
-        assert torch.allclose(mass[pages], ref[pages], atol=tol, rtol=tol), (
+        _, flat = _reference(head_cfg, page_size, seq_specs, views, scale,
+                             alpha=alpha, retention=1.0)
+        rows = slice(cu_view_pages[s], cu_view_pages[s + 1])
+        assert torch.allclose(mass[rows], ref[rows], atol=tol, rtol=tol), (
             f"seq {s} graded mass "
-            f"err={(mass[pages] - ref[pages]).abs().max().item():.2e}")
-        assert torch.allclose(mass_sc[pages], ref[pages], atol=tol, rtol=tol), (
+            f"err={(mass[rows] - ref[rows]).abs().max().item():.2e}")
+        assert torch.allclose(mass_sc[rows], ref[rows], atol=tol, rtol=tol), (
             f"seq {s} scalar graded mass "
-            f"err={(mass_sc[pages] - ref[pages]).abs().max().item():.2e}")
+            f"err={(mass_sc[rows] - ref[rows]).abs().max().item():.2e}")
         # The grading must actually change the mass, or the test is inert.
-        assert (flat[pages] - ref[pages]).abs().max().item() > 1e-2, (
+        assert (flat[rows] - ref[rows]).abs().max().item() > 1e-2, (
             f"seq {s}: the within-chunk retention had no effect")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_prefill_skips_mass(dtype):
+    """Without a mass the op computes the same o. The scalar kernel combines its
+    threads' outputs in atomic order, so fp32 agrees to rounding, not to the bit."""
+    head_cfg = (8, 2, 64)
+    views = _build_prefill(head_cfg, 16, BATCHES[0], dtype, seed=2)
+    scale = 1.0 / (head_cfg[2] ** 0.5)
+    decay = torch.ones(len(BATCHES[0]), device="cuda", dtype=torch.float32)
+    with_mass = _prefill(views, scale, _new_mass(views, 16, head_cfg[0]), decay)
+    without = ops.attn_prefill(
+        views["q"], views["k_pool"], views["v_pool"], views["page_tables"],
+        views["cu_seqlens_q"], views["seqlens_k"], views["rope_layout"], THETA, scale,
+    )
+    assert torch.allclose(with_mass, without, atol=1e-6, rtol=1e-5)
 
 
 _OPCHECK_UTILS = ("test_schema", "test_faketensor", "test_aot_dispatch_dynamic")
@@ -312,13 +336,15 @@ def _opcheck_inputs(dtype):
     q = torch.randn(8, 4, 8, device="cuda", dtype=dtype)
     k_pool = torch.randn(8, page_size, 2, 8, device="cuda", dtype=dtype)
     v_pool = torch.randn(8, page_size, 2, 8, device="cuda", dtype=dtype)
-    mass_pool = torch.zeros(8, page_size, 4, device="cuda", dtype=torch.float32)
     page_tables = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int32, device="cuda")
     cu_seqlens_q = torch.tensor([0, 5, 8], dtype=torch.int32, device="cuda")
     seqlens_k = torch.tensor([5, 20], dtype=torch.int32, device="cuda")
+    rope_layout = torch.tensor([[0, 0, -1], [2, 10, 4]], dtype=torch.int32, device="cuda")
+    mass = torch.zeros(6, page_size, 4, device="cuda", dtype=torch.float32)
+    cu_view_pages = torch.tensor([0, 3, 6], dtype=torch.int32, device="cuda")
     decay = torch.full((2,), 0.25, dtype=torch.float32, device="cuda")
-    return (q, k_pool, v_pool, mass_pool, page_tables, cu_seqlens_q, seqlens_k, 0.35,
-            decay)
+    return (q, k_pool, v_pool, page_tables, cu_seqlens_q, seqlens_k, rope_layout, THETA,
+            0.35, mass, cu_view_pages, decay)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

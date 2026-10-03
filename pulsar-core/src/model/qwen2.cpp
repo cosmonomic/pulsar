@@ -82,7 +82,7 @@ at::Tensor Qwen2Model::block(at::Tensor x, int64_t layer, const GroupBatch& g, A
     std::tie(q, k) = rope_qk(q, k, g.pos, this->n_heads, this->n_kv_heads, this->head_dim, this->rope_theta);
     // V is never roped; reshape to the paged ops' [tokens, n_kv_heads, head_dim].
     v = v.view({ntok, this->n_kv_heads, this->head_dim}).contiguous();
-    auto o = paged_attention(q, k, v, kv, layer, g, this->scale);
+    auto o = paged_attention(q, k, v, kv, layer, g, this->scale, this->rope_theta);
 
     o = o.reshape({ntok, this->n_heads * this->head_dim});
     x = x + at::linear(o, lw.o_proj_weight);

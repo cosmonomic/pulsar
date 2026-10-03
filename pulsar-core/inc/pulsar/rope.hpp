@@ -2,31 +2,39 @@
 
 #include <ATen/ATen.h>
 
+#include <bit>
 #include <cmath>
+#include <cstdint>
 #include <map>
 #include <mutex>
 #include <tuple>
 #include <vector>
 
 // Host-side RoPE angle arithmetic, shared by the CUDA kernels (rope.cu and
-// reposition.cu, through rope_common.cuh) and by the ATen rotation the recall
-// scorer applies (recall.cpp). Every rotation in the engine indexes the same
-// frequency table, so the scorer's rotation and the one its keys were stored with
-// cannot drift apart.
+// reposition.cu, through rope_common.cuh, and the paged attention kernels, through
+// pulsar/kernels/attn_params.cuh) and by the ATen rotation the recall scorer applies
+// (recall.cpp). Every table derives from the same theta^(-2j/head_dim) frequencies.
 
 namespace pulsar {
 
-// Device fp64 table of head_dim/2 RoPE inverse frequencies for a base theta,
-// carried in QUADRANTS per unit of position: entry j is
-// theta^(-2j/head_dim) * 2/pi, so multiplying by a position yields the angle in
-// units of pi/2 and rope_sincos reduces it with one subtraction.
-//
-// The table MUST stay fp64: its relative error scales by the position into the
-// angle, so an fp32 table puts 2e-3 radians on a 32k-position angle.
-//
-// Cached per (theta, head_dim, device) and never freed; the reference stays valid
+namespace detail {
+
+inline double quadrants_per_position(long double frequency) {
+    constexpr long double two_over_pi = 0.63661977236758134307553505349005745L;
+    return static_cast<double>(frequency * two_over_pi);
+}
+
+inline int64_t fixed_point_turns_per_position(long double frequency) {
+    constexpr long double two_pi = 6.28318530717958647692528676655900577L;
+    const long double fixed_point = std::nearbyint(std::ldexp(frequency / two_pi, 64));
+    return std::bit_cast<int64_t>(static_cast<uint64_t>(fixed_point));
+}
+
+// Device table of head_dim/2 entries, entry j = per_frequency(theta^(-2j/head_dim)),
+// built once per (theta, head_dim, device) and never freed; the reference stays valid
 // for the process.
-inline const at::Tensor& rope_quadrants_per_position(double theta, int64_t head_dim, at::Device device) {
+template <typename Element, Element (*per_frequency)(long double)>
+const at::Tensor& rope_frequency_table(double theta, int64_t head_dim, at::Device device, at::ScalarType dtype) {
     using Key = std::tuple<double, int64_t, int8_t>;
     static std::mutex guard;
     static auto* cache = new std::map<Key, at::Tensor>();
@@ -37,17 +45,41 @@ inline const at::Tensor& rope_quadrants_per_position(double theta, int64_t head_
         return found->second;
     }
 
-    constexpr long double two_over_pi = 0.63661977236758134307553505349005745L;
     const int64_t pairs = head_dim / 2;
-    std::vector<double> quadrants_per_position(pairs);
+    std::vector<Element> entries(pairs);
     for (int64_t j = 0; j < pairs; ++j) {
         const long double exponent = -2.0L * static_cast<long double>(j) / static_cast<long double>(head_dim);
-        quadrants_per_position[j] = static_cast<double>(
-            std::pow(static_cast<long double>(theta), exponent) * two_over_pi
-        );
+        entries[j] = per_frequency(std::pow(static_cast<long double>(theta), exponent));
     }
-    auto table = at::tensor(quadrants_per_position, at::dtype(at::kDouble)).to(device);
-    return cache->emplace(key, std::move(table)).first->second;
+    auto tensor = at::tensor(entries, at::dtype(dtype)).to(device);
+    return cache->emplace(key, std::move(tensor)).first->second;
+}
+
+}  // namespace detail
+
+// Device fp64 table of head_dim/2 RoPE inverse frequencies for a base theta,
+// carried in QUADRANTS per unit of position: entry j is
+// theta^(-2j/head_dim) * 2/pi, so multiplying by a position yields the angle in
+// units of pi/2 and rope_sincos reduces it with one subtraction.
+//
+// The table MUST stay fp64: its relative error scales by the position into the
+// angle, so an fp32 table puts 2e-3 radians on a 32k-position angle.
+inline const at::Tensor& rope_quadrants_per_position(double theta, int64_t head_dim, at::Device device) {
+    return detail::rope_frequency_table<double, detail::quadrants_per_position>(theta, head_dim, device, at::kDouble);
+}
+
+// Device table of head_dim/2 RoPE inverse frequencies for a base theta, carried in
+// TURNS per unit of position as 64-bit fixed point: entry j is
+// theta^(-2j/head_dim) / (2 pi) * 2^64, stored bit for bit in int64 (ATen has no
+// uint64). A position times an entry, wrapped mod 2^64, is the angle's fraction of a
+// turn to 2^-64 at any position, with no fp64 arithmetic on the device.
+inline const at::Tensor& rope_turns_per_position(double theta, int64_t head_dim, at::Device device) {
+    return detail::rope_frequency_table<int64_t, detail::fixed_point_turns_per_position>(
+        theta,
+        head_dim,
+        device,
+        at::kLong
+    );
 }
 
 // Rotate x's trailing head_dim axis by `position` TOKENS, in the rotate_half

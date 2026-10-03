@@ -8,47 +8,32 @@
 TORCH_LIBRARY(pulsar, m) {
     m.def("rmsnorm(Tensor x, Tensor weight, float eps) -> Tensor");
     m.def(
-        "attn_causal(Tensor q, Tensor k, Tensor v, "
-        "Tensor attention_mass, float scale, int causal_offset) -> (Tensor, Tensor)"
-    );
-    m.def(
-        "attn_causal_cache(Tensor q, Tensor k_cache, Tensor v_cache, "
-        "Tensor(a!) attention_mass, float scale, int cur_len) -> Tensor"
-    );
-    m.def(
         "write_kv(Tensor(a!) k_pool, Tensor(b!) v_pool, Tensor k_new, "
         "Tensor v_new, Tensor slot_mapping) -> ()"
     );
     m.def(
-        "attn_decode(Tensor q, Tensor k_pool, Tensor v_pool, "
-        "Tensor(a!) mass_pool, Tensor page_tables, Tensor context_lens, "
-        "float scale, Tensor attention_mass_decay, "
-        "Tensor(b!)? lse_capture=None, float mass_length_gain=0.) -> Tensor"
+        "attn_decode(Tensor q, Tensor k_pool, Tensor v_pool, Tensor page_tables, "
+        "Tensor context_lens, Tensor rope_layout, float rope_theta, float scale, "
+        "Tensor(a!)? mass=None, Tensor? cu_view_pages=None, Tensor? attention_mass_decay=None, "
+        "float mass_length_gain=0., Tensor(b!)? lse_capture=None, int num_splits=0) -> Tensor"
     );
     m.def(
-        "attn_decode_scalar(Tensor q, Tensor k_pool, "
-        "Tensor v_pool, Tensor(a!) mass_pool, Tensor page_tables, "
-        "Tensor context_lens, float scale, "
-        "Tensor attention_mass_decay, float mass_length_gain=0.) -> Tensor"
+        "attn_decode_scalar(Tensor q, Tensor k_pool, Tensor v_pool, Tensor page_tables, "
+        "Tensor context_lens, Tensor rope_layout, float rope_theta, float scale, "
+        "Tensor(a!)? mass=None, Tensor? cu_view_pages=None, Tensor? attention_mass_decay=None, "
+        "float mass_length_gain=0., Tensor(b!)? lse_capture=None) -> Tensor"
     );
     m.def(
-        "attn_decode_split(Tensor q, Tensor k_pool, "
-        "Tensor v_pool, Tensor(a!) mass_pool, Tensor page_tables, "
-        "Tensor context_lens, float scale, int num_splits, "
-        "Tensor attention_mass_decay, "
-        "Tensor(b!)? lse_capture=None, float mass_length_gain=0.) -> Tensor"
+        "attn_prefill(Tensor q, Tensor k_pool, Tensor v_pool, Tensor page_tables, "
+        "Tensor cu_seqlens_q, Tensor seqlens_k, Tensor rope_layout, float rope_theta, float scale, "
+        "Tensor(a!)? mass=None, Tensor? cu_view_pages=None, Tensor? attention_mass_decay=None, "
+        "float mass_length_gain=0., Tensor(b!)? lse_capture=None) -> Tensor"
     );
     m.def(
-        "attn_prefill(Tensor q, Tensor k_pool, Tensor v_pool, "
-        "Tensor(a!) mass_pool, Tensor page_tables, Tensor cu_seqlens_q, "
-        "Tensor seqlens_k, float scale, Tensor attention_mass_decay, "
-        "Tensor(b!)? lse_capture=None, float mass_length_gain=0.) -> Tensor"
-    );
-    m.def(
-        "attn_prefill_scalar(Tensor q, Tensor k_pool, "
-        "Tensor v_pool, Tensor(a!) mass_pool, Tensor page_tables, "
-        "Tensor cu_seqlens_q, Tensor seqlens_k, float scale, "
-        "Tensor attention_mass_decay, float mass_length_gain=0.) -> Tensor"
+        "attn_prefill_scalar(Tensor q, Tensor k_pool, Tensor v_pool, Tensor page_tables, "
+        "Tensor cu_seqlens_q, Tensor seqlens_k, Tensor rope_layout, float rope_theta, float scale, "
+        "Tensor(a!)? mass=None, Tensor? cu_view_pages=None, Tensor? attention_mass_decay=None, "
+        "float mass_length_gain=0., Tensor(b!)? lse_capture=None) -> Tensor"
     );
     m.def(
         "gemm_w4a16(Tensor x, Tensor weight_packed, Tensor weight_scale, "
@@ -75,12 +60,9 @@ TORCH_LIBRARY(pulsar, m) {
 
 TORCH_LIBRARY_IMPL(pulsar, CUDA, m) {
     m.impl("rmsnorm", TORCH_FN(pulsar::rmsnorm_cuda));
-    m.impl("attn_causal", TORCH_FN(pulsar::attn_causal_cuda));
-    m.impl("attn_causal_cache", TORCH_FN(pulsar::attn_causal_cache_cuda));
     m.impl("write_kv", TORCH_FN(pulsar::write_kv_cuda));
     m.impl("attn_decode", TORCH_FN(pulsar::attn_decode_cuda));
     m.impl("attn_decode_scalar", TORCH_FN(pulsar::attn_decode_scalar_cuda));
-    m.impl("attn_decode_split", TORCH_FN(pulsar::attn_decode_split_cuda));
     m.impl("attn_prefill", TORCH_FN(pulsar::attn_prefill_cuda));
     m.impl("attn_prefill_scalar", TORCH_FN(pulsar::attn_prefill_scalar_cuda));
     m.impl("gemm_w4a16", TORCH_FN(pulsar::gemm_w4a16_cuda));

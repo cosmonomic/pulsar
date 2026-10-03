@@ -1,13 +1,15 @@
 """torch.ops.pulsar.write_kv scatters new K/V rows into a shared page pool.
 torch.ops.pulsar.attn_decode does one-query-per-sequence decode attention over
-ragged contexts gathered through per-sequence page tables, accumulating a
-per-key mass into the pool in place.
+ragged views gathered through per-sequence page tables. The pool holds unrotated
+keys; the op rotates each to its position under the sequence's RoPE layout and
+accumulates a per-key mass into the sequence's own view rows.
 
-These tests compare against a plain-PyTorch paged reference, with shuffled
-non-contiguous physical pages to exercise the page-table indirection. For
-fp16/bf16, attn_decode's tensor-core result is also checked against the
-scalar reference op per physical slot of mass_pool (not just aggregate error),
-so a wrong fragment-to-slot mapping cannot hide behind an aggregate check.
+These tests compare against a plain-PyTorch reference that rotates the gathered
+keys with ops.rope, over shuffled lanes where two views share a lane, under both
+the contiguous and the compacted layout. For fp16/bf16, attn_decode's tensor-core
+result is also checked against the scalar reference op per mass slot (not just
+aggregate error), so a wrong fragment-to-slot mapping cannot hide behind an
+aggregate check.
 Requires a CUDA device and the built pulsar extension.
 """
 
@@ -31,10 +33,9 @@ HEAD_CONFIGS = [
 
 PAGE_SIZES = [16, 32]
 
-# Forced split counts for the flash-decode split op. 1 exercises the 3-kernel
-# path at a single split; the larger counts (with the short CONTEXT_LENS below)
-# produce splits that exceed some sequences' tile counts, covering the
-# empty-split path.
+# Forced split counts for the flash-decode path. 1 exercises the 3-kernel path at a
+# single split; the larger counts (with the short CONTEXT_LENS below) produce splits
+# that exceed some sequences' tile counts, covering the empty-split path.
 SPLIT_COUNTS = [1, 2, 3, 4, 8]
 
 # Ragged context lengths; includes non-multiples of page_size and > one page.
@@ -42,6 +43,8 @@ CONTEXT_LENS = [
     [1, 7, 16, 33, 40, 65, 100, 129],
     [3, 15, 17, 48, 63],
 ]
+
+THETA = 1000000.0
 
 
 def _tols(dtype):
@@ -54,6 +57,25 @@ def _tols(dtype):
 
 def _pages_needed(ctx, page_size):
     return (ctx + page_size - 1) // page_size
+
+
+def _layout(ctx, compacted):
+    """{n_sink, working_lo, short_offset}: the identity, or a compacted layout whose
+    distant region is the middle of the view."""
+    if not compacted:
+        return (0, 0, -1)
+    n_sink = min(4, ctx)
+    working_lo = max(n_sink, ctx - 24)
+    return (n_sink, working_lo, n_sink + 3)
+
+
+def _positions(layout, ctx):
+    n_sink, working_lo, short_offset = layout
+    return [
+        j if j < n_sink else short_offset if j < working_lo
+        else short_offset + 1 + j - working_lo
+        for j in range(ctx)
+    ]
 
 
 def _check_write(dtype, page_size):
@@ -97,28 +119,34 @@ def _check_write(dtype, page_size):
     return written_ok and untouched_ok
 
 
-def _build_paged(head_cfg, page_size, context_lens, dtype, seed):
-    """Builds a pool and page tables with disjoint shuffled physical pages per
-    sequence, writes random K/V, and returns per-sequence contiguous logical K/V
-    for the reference."""
+def _build_views(head_cfg, page_size, context_lens, dtype, seed):
+    """Builds a pool of unrotated K/V and one view per sequence over shuffled lanes.
+    View 1 takes view 0's first lane as its own first page, so the two share it at
+    different view positions; odd sequences use the compacted layout."""
     torch.manual_seed(seed)
     n_q_heads, n_kv_heads, head_dim = head_cfg
     num_seqs = len(context_lens)
 
     per_seq_pages = [_pages_needed(c, page_size) for c in context_lens]
     max_pages = max(per_seq_pages)
-    total_pages = sum(per_seq_pages) + 3  # a few spare pages
+    total_pages = sum(per_seq_pages) + 3  # a few spare lanes
 
     perm = torch.randperm(total_pages).tolist()
-    page_tables = torch.zeros(num_seqs, max_pages, dtype=torch.int32)
+    seq_lanes = []
     cursor = 0
-    seq_phys = []
-    for s, nb in enumerate(per_seq_pages):
-        phys = perm[cursor : cursor + nb]
+    for nb in per_seq_pages:
+        seq_lanes.append(perm[cursor : cursor + nb])
         cursor += nb
-        seq_phys.append(phys)
-        for b in range(nb):
-            page_tables[s, b] = phys[b]
+    if num_seqs > 1:
+        seq_lanes[1][0] = seq_lanes[0][0]
+    page_tables = torch.zeros(num_seqs, max_pages, dtype=torch.int32)
+    for s, lanes in enumerate(seq_lanes):
+        page_tables[s, : len(lanes)] = torch.tensor(lanes, dtype=torch.int32)
+
+    layouts = [_layout(ctx, s % 2 == 1) for s, ctx in enumerate(context_lens)]
+    cu_view_pages = [0]
+    for nb in per_seq_pages:
+        cu_view_pages.append(cu_view_pages[-1] + nb)
 
     k_pool = torch.randn(
         total_pages, page_size, n_kv_heads, head_dim, device="cuda", dtype=dtype
@@ -126,134 +154,118 @@ def _build_paged(head_cfg, page_size, context_lens, dtype, seed):
     v_pool = torch.randn(
         total_pages, page_size, n_kv_heads, head_dim, device="cuda", dtype=dtype
     )
-
-    ref_k, ref_v = [], []
-    for s, ctx in enumerate(context_lens):
-        ks = torch.empty(ctx, n_kv_heads, head_dim, device="cuda", dtype=dtype)
-        vs = torch.empty(ctx, n_kv_heads, head_dim, device="cuda", dtype=dtype)
-        for j in range(ctx):
-            phys = seq_phys[s][j // page_size]
-            off = j % page_size
-            ks[j] = k_pool[phys, off]
-            vs[j] = v_pool[phys, off]
-        ref_k.append(ks)
-        ref_v.append(vs)
-
     q = torch.randn(num_seqs, n_q_heads, head_dim, device="cuda", dtype=dtype)
-    context_lens_t = torch.tensor(context_lens, dtype=torch.int32, device="cuda")
-    page_tables = page_tables.to("cuda")
-    return (q, k_pool, v_pool, page_tables, context_lens_t, seq_phys, ref_k, ref_v)
+    return dict(
+        q=q,
+        k_pool=k_pool,
+        v_pool=v_pool,
+        page_tables=page_tables.to("cuda"),
+        context_lens=torch.tensor(context_lens, dtype=torch.int32, device="cuda"),
+        rope_layout=torch.tensor(layouts, dtype=torch.int32, device="cuda"),
+        cu_view_pages=torch.tensor(cu_view_pages, dtype=torch.int32, device="cuda"),
+        seq_lanes=seq_lanes,
+        layouts=layouts,
+        total_view_pages=cu_view_pages[-1],
+    )
 
 
-def _reference(
-    head_cfg, page_size, context_lens, q, seq_phys, ref_k, ref_v, total_pages, scale
-):
+def _view_kv(views, s, ctx):
+    """Sequence s's keys rotated to their layout positions by ops.rope (stored back
+    in the pool dtype, as the kernels round them) and its values, both fp32
+    [ctx, n_kv_heads, head_dim]."""
+    k_pool, v_pool = views["k_pool"], views["v_pool"]
+    n_kv_heads, head_dim = k_pool.shape[2], k_pool.shape[3]
+    lanes = torch.tensor(views["seq_lanes"][s], device="cuda")
+    k = k_pool[lanes].reshape(-1, n_kv_heads, head_dim)[:ctx]
+    v = v_pool[lanes].reshape(-1, n_kv_heads, head_dim)[:ctx]
+    pos = torch.tensor(
+        _positions(views["layouts"][s], ctx), dtype=torch.int64, device="cuda"
+    )
+    k = ops.rope(k.transpose(0, 1).contiguous(), pos, THETA).transpose(0, 1)
+    return k.float(), v.float()
+
+
+def _reference(head_cfg, page_size, context_lens, views, scale):
     n_q_heads, n_kv_heads, head_dim = head_cfg
     group = n_q_heads // n_kv_heads
-    num_seqs = len(context_lens)
+    q = views["q"]
+    cu_view_pages = views["cu_view_pages"].tolist()
 
     o_ref = torch.empty(
-        num_seqs, n_q_heads, head_dim, device="cuda", dtype=torch.float32
+        len(context_lens), n_q_heads, head_dim, device="cuda", dtype=torch.float32
     )
     mass_ref = torch.zeros(
-        total_pages, page_size, n_q_heads, device="cuda", dtype=torch.float32
+        views["total_view_pages"], page_size, n_q_heads, device="cuda",
+        dtype=torch.float32,
     )
+    mass_rows = mass_ref.view(-1, n_q_heads)
 
     for s, ctx in enumerate(context_lens):
-        ks = ref_k[s].float()  # [ctx, n_kv_heads, head_dim]
-        vs = ref_v[s].float()
+        ks, vs = _view_kv(views, s, ctx)
+        first_row = cu_view_pages[s] * page_size
         for h in range(n_q_heads):
             g = h // group
-            kg = ks[:, g, :]  # [ctx, head_dim]
-            vg = vs[:, g, :]
-            scores = scale * (q[s, h].float() @ kg.t())  # [ctx]
+            scores = scale * (ks[:, g, :] @ q[s, h].float())  # [ctx]
             w = torch.softmax(scores, dim=0)
-            o_ref[s, h] = w @ vg
-            for j in range(ctx):
-                phys = seq_phys[s][j // page_size]
-                off = j % page_size
-                mass_ref[phys, off, h] += w[j] * ctx  # scaled by ctx, own column for h
+            o_ref[s, h] = w @ vs[:, g, :]
+            mass_rows[first_row : first_row + ctx, h] += w * ctx
     return o_ref, mass_ref
 
 
-def _check_decode(head_cfg, page_size, context_lens, dtype):
-    q, k_pool, v_pool, page_tables, context_lens_t, seq_phys, ref_k, ref_v = (
-        _build_paged(head_cfg, page_size, context_lens, dtype, seed=1)
+def _decode(views, scale, mass, decay, op=None, **kwargs):
+    op = op or ops.attn_decode
+    return op(
+        views["q"], views["k_pool"], views["v_pool"], views["page_tables"],
+        views["context_lens"], views["rope_layout"], THETA, scale, mass,
+        views["cu_view_pages"], decay, **kwargs,
     )
-    total_pages = k_pool.size(0)
+
+
+def _check_decode(head_cfg, page_size, context_lens, dtype):
+    views = _build_views(head_cfg, page_size, context_lens, dtype, seed=1)
     head_dim = head_cfg[2]
     scale = 1.0 / (head_dim**0.5)
 
-    # ops.attn_decode runs the tensor-core kernel for fp16/bf16, scalar for fp32.
-    # Mass is per query head (head_cfg[0]); each head writes its own column.
-    mass_pool = torch.zeros(
-        total_pages, page_size, head_cfg[0], device="cuda", dtype=torch.float32
-    )
+    def new_mass():
+        return torch.zeros(
+            views["total_view_pages"], page_size, head_cfg[0], device="cuda",
+            dtype=torch.float32,
+        )
+
     # decay=1.0 disables the EMA gain, so mass accumulates the raw normalized
     # weight the reference computes.
     decay = torch.ones(len(context_lens), device="cuda", dtype=torch.float32)
-    o = ops.attn_decode(
-        q, k_pool, v_pool, mass_pool, page_tables, context_lens_t, scale, decay,
+    # ops.attn_decode runs the tensor-core kernel for fp16/bf16, scalar for fp32.
+    mass = new_mass()
+    o = _decode(views, scale, mass, decay)
+    mass_scalar = new_mass()
+    o_scalar = _decode(
+        views, scale, mass_scalar, decay, op=torch.ops.pulsar.attn_decode_scalar
     )
-
-    # Scalar oracle op on the same inputs (fresh mass pool).
-    mass_scalar = torch.zeros_like(mass_pool)
-    o_scalar = torch.ops.pulsar.attn_decode_scalar(
-        q, k_pool, v_pool, mass_scalar, page_tables, context_lens_t, scale, decay,
-    )
-
-    o_ref, mass_ref = _reference(
-        head_cfg,
-        page_size,
-        context_lens,
-        q,
-        seq_phys,
-        ref_k,
-        ref_v,
-        total_pages,
-        scale,
-    )
+    o_ref, mass_ref = _reference(head_cfg, page_size, context_lens, views, scale)
 
     tols = _tols(dtype)
     o_err = (o.float() - o_ref).abs().max().item()
-    m_err = (mass_pool - mass_ref).abs().max().item()
-    o_ok = torch.allclose(o.float(), o_ref, atol=tols["atol"], rtol=tols["rtol"])
-    m_ok = torch.allclose(mass_pool, mass_ref, atol=1e-3, rtol=1e-3)
+    m_err = (mass - mass_ref).abs().max().item()
+    o_ok = torch.allclose(o.float(), o_ref, **tols)
+    m_ok = torch.allclose(mass, mass_ref, atol=1e-3, rtol=1e-3)
 
-    # Mass compared per physical slot (both fp32) against the scalar oracle.
+    # Mass compared per slot (both fp32) against the scalar oracle; no slot may differ
+    # beyond fp32 accumulation noise.
     o_vs_scalar = (o.float() - o_scalar.float()).abs().max().item()
-    m_vs_scalar = (mass_pool - mass_scalar).abs().max().item()
-    o_sc_ok = torch.allclose(
-        o.float(), o_scalar.float(), atol=tols["atol"], rtol=tols["rtol"]
-    )
-    # No slot may differ beyond fp32 accumulation noise; this catches a mass
-    # value landing on the wrong (page, offset, head h).
-    m_sc_ok = torch.allclose(mass_pool, mass_scalar, atol=1e-4, rtol=1e-4)
+    m_vs_scalar = (mass - mass_scalar).abs().max().item()
+    o_sc_ok = torch.allclose(o.float(), o_scalar.float(), **tols)
+    m_sc_ok = torch.allclose(mass, mass_scalar, atol=1e-4, rtol=1e-4)
 
-    # Forced-split (flash-decode) op at several split counts, each checked
-    # against the reference and the scalar oracle. For fp32 the split op routes
-    # to the scalar kernel (no tensor-core path), so it trivially matches.
+    # Forced-split (flash-decode) path at several split counts. For fp32 the op
+    # routes to the scalar kernel, so it trivially matches.
     split_m_vs_scalar = 0.0
     for num_splits in SPLIT_COUNTS:
-        mass_split = torch.zeros_like(mass_pool)
-        o_split = torch.ops.pulsar.attn_decode_split(
-            q,
-            k_pool,
-            v_pool,
-            mass_split,
-            page_tables,
-            context_lens_t,
-            scale,
-            num_splits,
-            decay,
-        )
-        o_ok = o_ok and torch.allclose(
-            o_split.float(), o_ref, atol=tols["atol"], rtol=tols["rtol"]
-        )
+        mass_split = new_mass()
+        o_split = _decode(views, scale, mass_split, decay, num_splits=num_splits)
+        o_ok = o_ok and torch.allclose(o_split.float(), o_ref, **tols)
         m_ok = m_ok and torch.allclose(mass_split, mass_ref, atol=1e-3, rtol=1e-3)
-        o_sc_ok = o_sc_ok and torch.allclose(
-            o_split.float(), o_scalar.float(), atol=tols["atol"], rtol=tols["rtol"]
-        )
+        o_sc_ok = o_sc_ok and torch.allclose(o_split.float(), o_scalar.float(), **tols)
         m_sc_ok = m_sc_ok and torch.allclose(
             mass_split, mass_scalar, atol=1e-4, rtol=1e-4
         )
@@ -289,7 +301,46 @@ def test_paged_decode(dtype, page_size, head_cfg, context_lens):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_decode_skips_mass(dtype):
+    """Without a mass the op computes the same o. The scalar kernel combines its
+    threads' outputs in atomic order, so fp32 agrees to rounding, not to the bit."""
+    head_cfg = (8, 2, 64)
+    views = _build_views(head_cfg, 16, [40, 70], dtype, seed=2)
+    scale = 1.0 / (head_cfg[2] ** 0.5)
+    mass = torch.zeros(
+        views["total_view_pages"], 16, head_cfg[0], device="cuda", dtype=torch.float32
+    )
+    decay = torch.ones(2, device="cuda", dtype=torch.float32)
+    with_mass = _decode(views, scale, mass, decay)
+    without = ops.attn_decode(
+        views["q"], views["k_pool"], views["v_pool"], views["page_tables"],
+        views["context_lens"], views["rope_layout"], THETA, scale,
+    )
+    assert torch.allclose(with_mass, without, atol=1e-6, rtol=1e-5)
+
+
 _OPCHECK_UTILS = ("test_schema", "test_faketensor", "test_aot_dispatch_dynamic")
+
+
+def _opcheck_decode_inputs(dtype):
+    page_size = 16
+    q = torch.randn(3, 4, 8, device="cuda", dtype=dtype)
+    k_pool = torch.randn(8, page_size, 2, 8, device="cuda", dtype=dtype)
+    v_pool = torch.randn(8, page_size, 2, 8, device="cuda", dtype=dtype)
+    page_tables = torch.tensor(
+        [[0, 1, 2], [3, 4, 5], [6, 7, 0]], dtype=torch.int32, device="cuda"
+    )
+    context_lens = torch.tensor([5, 20, 33], dtype=torch.int32, device="cuda")
+    rope_layout = torch.tensor(
+        [[0, 0, -1], [2, 10, 4], [0, 0, -1]], dtype=torch.int32, device="cuda"
+    )
+    mass = torch.zeros(9, page_size, 4, device="cuda", dtype=torch.float32)
+    cu_view_pages = torch.tensor([0, 3, 6, 9], dtype=torch.int32, device="cuda")
+    decay = torch.ones(3, dtype=torch.float32, device="cuda")
+    return (q, k_pool, v_pool, page_tables, context_lens, rope_layout, THETA, 0.35,
+            mass, cu_view_pages, decay)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -311,19 +362,9 @@ def test_opcheck_write():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_opcheck_decode():
     for dtype in DTYPES:
-        page_size = 16
-        q = torch.randn(3, 4, 8, device="cuda", dtype=dtype)
-        k_pool = torch.randn(8, page_size, 2, 8, device="cuda", dtype=dtype)
-        v_pool = torch.randn(8, page_size, 2, 8, device="cuda", dtype=dtype)
-        mass_pool = torch.zeros(8, page_size, 4, device="cuda", dtype=torch.float32)
-        page_tables = torch.tensor(
-            [[0, 1, 2], [3, 4, 5], [6, 7, 0]], dtype=torch.int32, device="cuda"
-        )
-        context_lens = torch.tensor([5, 20, 33], dtype=torch.int32, device="cuda")
-        decay = torch.ones(3, dtype=torch.float32, device="cuda")
         torch.library.opcheck(
             torch.ops.pulsar.attn_decode,
-            (q, k_pool, v_pool, mass_pool, page_tables, context_lens, 0.35, decay),
+            _opcheck_decode_inputs(dtype),
             test_utils=_OPCHECK_UTILS,
         )
 
@@ -331,19 +372,10 @@ def test_opcheck_decode():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_opcheck_decode_split():
     for dtype in DTYPES:
-        page_size = 16
-        q = torch.randn(3, 4, 8, device="cuda", dtype=dtype)
-        k_pool = torch.randn(8, page_size, 2, 8, device="cuda", dtype=dtype)
-        v_pool = torch.randn(8, page_size, 2, 8, device="cuda", dtype=dtype)
-        mass_pool = torch.zeros(8, page_size, 4, device="cuda", dtype=torch.float32)
-        page_tables = torch.tensor(
-            [[0, 1, 2], [3, 4, 5], [6, 7, 0]], dtype=torch.int32, device="cuda"
-        )
-        context_lens = torch.tensor([5, 20, 33], dtype=torch.int32, device="cuda")
-        decay = torch.ones(3, dtype=torch.float32, device="cuda")
         torch.library.opcheck(
-            torch.ops.pulsar.attn_decode_split,
-            (q, k_pool, v_pool, mass_pool, page_tables, context_lens, 0.35, 2, decay),
+            torch.ops.pulsar.attn_decode,
+            _opcheck_decode_inputs(dtype),
+            {"num_splits": 2},
             test_utils=_OPCHECK_UTILS,
         )
 
