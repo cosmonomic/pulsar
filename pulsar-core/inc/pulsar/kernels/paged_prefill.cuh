@@ -1,5 +1,6 @@
 #pragma once
 
+#include "pulsar/kernels/attn_params.cuh"
 #include "pulsar/kernels/attn_tiles.cuh"
 
 #include <cuda_runtime.h>
@@ -11,11 +12,13 @@
 // Tensor-core prefill attention. Flash-attention-style: one CTA per (query-tile,
 // q head); a query tile is up to 16 query tokens of ONE q head, occupying MMA
 // rows 0..tile_rows-1 (rows tile_rows..15 are zero-padded and discarded). The
-// causal key range is streamed KEY_PAGES physical pages (KEY_PAGES * PAGE_SIZE
-// keys) at a time; the causal mask is applied per (query row, key) in the online
-// softmax. A second streaming pass recomputes QKᵀ and atomicAdds the per-key mass
+// causal key range is streamed KEY_PAGES pages (KEY_PAGES * PAGE_SIZE keys) at a
+// time: keys from rotated_k, the views' keys already rotated to their positions by
+// rotate_view_keys_kernel (kernels/paged_prefill.cu), and values from the pool
+// through the page table. The
+// causal mask is applied per (query row, key) in the online softmax. A second streaming pass recomputes QKᵀ and atomicAdds the per-key mass
 // (summed over this tile's query rows with p >= kp, all for the ONE q head) into
-// this q head's own mass_pool column (per query head). The QKᵀ/PV tiles live in
+// this q head's own column of the key's mass row. The QKᵀ/PV tiles live in
 // attn_tiles.cuh; the op wrapper and the argument shapes are in
 // kernels/paged_prefill.cu.
 //
@@ -31,24 +34,10 @@ namespace attn {
 
 template <typename scalar_t, int PAGE_SIZE, int HEAD_DIM, bool BF16, int NWARPS, int KEY_PAGES, int CTAS_PER_SM>
 __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kernel(
-    const scalar_t* __restrict__ q,
-    const scalar_t* __restrict__ k_pool,
-    const scalar_t* __restrict__ v_pool,
-    float* __restrict__ mass_pool,  // null skips the mass pass
-    const int32_t* __restrict__ page_tables,
-    const int32_t* __restrict__ cu_seqlens_q,
-    const int32_t* __restrict__ seqlens_k,
-    const float* __restrict__ attention_mass_decay,  // [num_seqs] EMA gain alpha
-    float mass_length_gain,  // <= 0 => each row's own causal key count
+    const PagedAttnParams<scalar_t> p,
+    const scalar_t* __restrict__ rotated_k,  // [num_seqs * max_pages, page_size, n_kv_heads, head_dim]
     const int32_t* __restrict__ tile_seq,  // [ntiles] seq owning each query-tile
-    const int32_t* __restrict__ tile_qbase,  // [ntiles] local query start of tile
-    scalar_t* __restrict__ o,
-    float* __restrict__ lse_global,  // [total_q, n_q_heads]; null when not captured
-    int n_q_heads,
-    int n_kv_heads,
-    int max_pages,
-    int group,
-    float scale
+    const int32_t* __restrict__ tile_qbase  // [ntiles] local query start of tile
 ) {
     constexpr int KEY_TILE = PAGE_SIZE * KEY_PAGES;
     // sS row stride. A stride of exactly KEY_TILE puts every row of a column on one
@@ -72,18 +61,18 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
     const int sweep_row = tid / kSweepLanes;
     const int sweep_lane = tid % kSweepLanes;
     const int blk = blockIdx.x;
-    const int tile = blk / n_q_heads;
-    const int h = blk % n_q_heads;
-    const int g = h / group;
+    const int tile = blk / p.n_q_heads;
+    const int h = blk % p.n_q_heads;
+    const int g = h / p.group;
 
     const int s = tile_seq[tile];
     // This sequence's EMA gain alpha and the retention 1 - alpha it implies.
-    const float mass_decay = attention_mass_decay[s];
+    const float mass_decay = p.mass ? p.mass_decay[s] : 0.0f;
     const float retention = 1.0f - mass_decay;
     const int qbase = tile_qbase[tile];
-    const int q0 = cu_seqlens_q[s];
-    const int seq_q = cu_seqlens_q[s + 1] - q0;
-    const int ctx_len = seqlens_k[s];
+    const int q0 = p.cu_seqlens_q[s];
+    const int seq_q = p.cu_seqlens_q[s + 1] - q0;
+    const int ctx_len = p.seqlens_k[s];
     const int ctx_start = ctx_len - seq_q;
     const int tile_rows = min(16, seq_q - qbase);
     const int q_global_base = q0 + qbase;
@@ -91,8 +80,8 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
     const int max_p = ctx_start + qbase + tile_rows - 1;
     const int n_key_tiles = max_p / KEY_TILE + 1;  // tiles covering keys [0, max_p]
 
-    const int32_t* seq_table = page_tables + static_cast<int64_t>(s) * max_pages;
-    const int64_t stride_slot = static_cast<int64_t>(n_kv_heads) * HEAD_DIM;
+    const int32_t* seq_table = p.page_tables + static_cast<int64_t>(s) * p.max_pages;
+    const int64_t stride_slot = static_cast<int64_t>(p.n_kv_heads) * HEAD_DIM;
 
     static_assert(sizeof(scalar_t) == 2, "the tile staging copies 8 elements at a time");
     constexpr int kChunkElems = 16 / sizeof(scalar_t);
@@ -124,8 +113,8 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
         const int row = i / HEAD_DIM, col = i % HEAD_DIM;
         scalar_t v = static_cast<scalar_t>(0);
         if (row < tile_rows) {
-            const int64_t qi = (static_cast<int64_t>(q_global_base + row) * n_q_heads + h) * HEAD_DIM;
-            v = q[qi + col];
+            const int64_t qi = (static_cast<int64_t>(q_global_base + row) * p.n_q_heads + h) * HEAD_DIM;
+            v = p.q[qi + col];
         }
         sQ[attn::swizzled_offset<HEAD_DIM>(row, col)] = v;
     }
@@ -148,40 +137,43 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
         // retention^0. The row attends the row_pos + 1 causal keys [0, row_pos].
         // __powf(0, 0) is NaN, so the zero exponent is taken directly.
         const int chunk_end_offset = seq_q - 1 - qbase - tid;
-        const float attended_len = mass_length_gain > 0.0f ? mass_length_gain : static_cast<float>(row_pos + 1);
+        const float attended_len = p.mass_length_gain > 0.0f ? p.mass_length_gain : static_cast<float>(row_pos + 1);
         mass_weight[tid] = (tid < tile_rows)
             ? (chunk_end_offset == 0 ? 1.0f : __powf(retention, static_cast<float>(chunk_end_offset))) * attended_len
             : 0.0f;
     }
-    // Physical page ids of key tile t. The staging address arithmetic is a 64-bit
-    // multiply chain off these, so they are read a whole iteration before the
-    // stage_tile that consumes them. A tile may reach past the sequence's last
-    // page; seq_table is only populated up to it.
-    auto load_pages = [&](int t, int* pages) {
+    // The pages of key tile t, in the pool (lanes, for V) and in rotated_k (sequence
+    // s's view page b is page s * max_pages + b, for K). The staging address
+    // arithmetic is a 64-bit multiply chain off these, so they are read a whole
+    // iteration before the stage_tile that consumes them. A tile may reach past the
+    // sequence's last page; seq_table is only populated up to it.
+    auto load_pages = [&](int t, int* lanes, int* key_pages) {
 #pragma unroll
-        for (int p = 0; p < KEY_PAGES; ++p) {
-            const int page_base = t * KEY_TILE + p * PAGE_SIZE;
-            pages[p] = (t < n_key_tiles && page_base < ctx_len) ? seq_table[t * KEY_PAGES + p] : 0;
+        for (int kp = 0; kp < KEY_PAGES; ++kp) {
+            const int page_base = t * KEY_TILE + kp * PAGE_SIZE;
+            const bool in_view = t < n_key_tiles && page_base < ctx_len;
+            lanes[kp] = in_view ? seq_table[t * KEY_PAGES + kp] : 0;
+            key_pages[kp] = in_view ? s * p.max_pages + t * KEY_PAGES + kp : 0;
         }
     };
 
-    // Stage one key tile of the pool into its shared tile. Always commits a group,
-    // empty tile included, so every iteration costs the same number of groups and a
-    // wait count means the same thing throughout. `pool` selects K or V; both land
-    // at the same offsets, so one routine serves either.
+    // Stage one key tile into its shared tile. Always commits a group, empty tile
+    // included, so every iteration costs the same number of groups and a wait count
+    // means the same thing throughout. `pool` selects K or V; both land at the same
+    // offsets, so one routine serves either.
     auto stage_tile = [&](const scalar_t* pool, scalar_t* dst, int t, const int* pages) {
         if (t < n_key_tiles) {
 #pragma unroll
-            for (int p = 0; p < KEY_PAGES; ++p) {
-                const int page_base = t * KEY_TILE + p * PAGE_SIZE;
+            for (int kp = 0; kp < KEY_PAGES; ++kp) {
+                const int page_base = t * KEY_TILE + kp * PAGE_SIZE;
                 const int valid = min(PAGE_SIZE, ctx_len - page_base);
-                const int64_t slot0 = (static_cast<int64_t>(pages[p]) * PAGE_SIZE) * n_kv_heads + g;
+                const int64_t slot0 = (static_cast<int64_t>(pages[kp]) * PAGE_SIZE) * p.n_kv_heads + g;
                 for (int c = tid; c < kPageChunks; c += NWARPS * 32) {
                     const int off = c / kRowChunks;
                     const int d = (c % kRowChunks) * kChunkElems;
                     const int64_t idx = slot0 * HEAD_DIM + static_cast<int64_t>(off) * stride_slot + d;
                     attn::cp_async_16(
-                        dst + attn::swizzled_offset<HEAD_DIM>(p * PAGE_SIZE + off, d),
+                        dst + attn::swizzled_offset<HEAD_DIM>(kp * PAGE_SIZE + off, d),
                         pool + idx,
                         off < valid ? 16 : 0
                     );
@@ -195,22 +187,22 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
     // the bottom, so each is staged one full iteration ahead of its use: K right
     // after the QKᵀ that frees its tile, V right after that PV. Two groups are in
     // flight at every wait, oldest first, so both waits leave one outstanding.
-    int tile_pages[KEY_PAGES], next_pages[KEY_PAGES];
-    load_pages(0, tile_pages);
-    stage_tile(k_pool, sK, 0, tile_pages);
-    stage_tile(v_pool, sV, 0, tile_pages);
+    int tile_lanes[KEY_PAGES], next_lanes[KEY_PAGES], tile_keys[KEY_PAGES], next_keys[KEY_PAGES];
+    load_pages(0, tile_lanes, tile_keys);
+    stage_tile(rotated_k, sK, 0, tile_keys);
+    stage_tile(p.v_pool, sV, 0, tile_lanes);
     __syncthreads();
 
     // Pass 1: online-softmax attention with per-(row,key) causal masking.
     for (int t = 0; t < n_key_tiles; ++t) {
         const int tile_base = t * KEY_TILE;
-        load_pages(t + 1, next_pages);
+        load_pages(t + 1, next_lanes, next_keys);
         attn::cp_async_wait<1>();
         __syncthreads();
 
         attn::tile_qkt<scalar_t, KEY_TILE, HEAD_DIM, BF16, SCORE_STRIDE, true>(sQ, sK, sS, warp, NWARPS);
         __syncthreads();
-        stage_tile(k_pool, sK, t + 1, next_pages);
+        stage_tile(rotated_k, sK, t + 1, next_keys);
 
         if (tid < kSweepThreads) {
             const int pm = qpos[sweep_row];
@@ -219,7 +211,7 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
             for (int j = 0; j < kSweepCols; ++j) {
                 const int c = sweep_lane * kSweepCols + j;
                 if (tile_base + c <= pm) {
-                    tmax = fmaxf(tmax, scale * sS[sweep_row * SCORE_STRIDE + c]);
+                    tmax = fmaxf(tmax, p.scale * sS[sweep_row * SCORE_STRIDE + c]);
                 }
             }
 #pragma unroll
@@ -240,7 +232,7 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
         for (int i = tid; i < 16 * KEY_TILE; i += NWARPS * 32) {
             const int m = i / KEY_TILE, c = i % KEY_TILE;
             float& score = sS[m * SCORE_STRIDE + c];
-            const float pw = tile_base + c <= qpos[m] ? __expf(scale * score - Mrow[m]) : 0.0f;
+            const float pw = tile_base + c <= qpos[m] ? __expf(p.scale * score - Mrow[m]) : 0.0f;
             score = pw;
             sP[i] = static_cast<scalar_t>(pw);
         }
@@ -266,7 +258,7 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
 
         attn::tile_pv_registers<scalar_t, KEY_TILE, HEAD_DIM, BF16, NWARPS, true>(sP, sV, row_rescale, out_acc, warp);
         __syncthreads();
-        stage_tile(v_pool, sV, t + 1, next_pages);
+        stage_tile(p.v_pool, sV, t + 1, next_lanes);
     }
 
     // Normalize + write o, each lane over the accumulators it owns.
@@ -276,9 +268,8 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
         const float inv_low = 1.0f / Lrow[gid], inv_high = 1.0f / Lrow[gid + 8];
         auto store = [&](int row, int col, float value, float inv_denom) {
             if (row < tile_rows) {
-                o[(static_cast<int64_t>(q_global_base + row) * n_q_heads + h) * HEAD_DIM + col] = static_cast<scalar_t>(
-                    value * inv_denom
-                );
+                p.o[(static_cast<int64_t>(q_global_base + row) * p.n_q_heads + h) * HEAD_DIM +
+                    col] = static_cast<scalar_t>(value * inv_denom);
             }
         };
 #pragma unroll
@@ -303,39 +294,40 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
     // Stash LSE for the mass pass.
     if (tid < tile_rows) {
         LSE[tid] = Mrow[tid] + logf(Lrow[tid]);
-        if (lse_global) {
-            lse_global[static_cast<int64_t>(q_global_base + tid) * n_q_heads + h] = LSE[tid];
+        if (p.lse) {
+            p.lse[static_cast<int64_t>(q_global_base + tid) * p.n_q_heads + h] = LSE[tid];
         }
     }
     __syncthreads();
 
     // Pass 2: recompute QKᵀ and accumulate per-key mass (summed over this tile's
     // query rows with p >= kp, this ONE q head), atomicAdd into this q head's own
-    // mass_pool column at each key's physical slot. Nothing else in the kernel
-    // touches mass, so a layer whose mass is never read stops here.
-    if (!mass_pool) {
+    // column of each key's mass row. Nothing else in the kernel touches mass, so a
+    // layer whose mass is never read stops here.
+    if (!p.mass) {
         return;
     }
+    float* mass = seq_mass(p, s, ctx_len, PAGE_SIZE);
     // Only K is re-streamed here, so one tile is in flight and QKᵀ frees the shared
     // tile for the next one.
-    load_pages(0, tile_pages);
-    stage_tile(k_pool, sK, 0, tile_pages);
+    load_pages(0, tile_lanes, tile_keys);
+    stage_tile(rotated_k, sK, 0, tile_keys);
     for (int t = 0; t < n_key_tiles; ++t) {
         const int tile_base = t * KEY_TILE;
-        load_pages(t + 1, next_pages);
+        load_pages(t + 1, next_lanes, next_keys);
         attn::cp_async_wait<0>();
         __syncthreads();
 
         attn::tile_qkt<scalar_t, KEY_TILE, HEAD_DIM, BF16, SCORE_STRIDE, true>(sQ, sK, sS, warp, NWARPS);
         __syncthreads();
-        stage_tile(k_pool, sK, t + 1, next_pages);
+        stage_tile(rotated_k, sK, t + 1, next_keys);
 
         // One thread per (query row, key): the exponentials run across the CTA,
         // and sS carries each row's weighted share to the per-key sum below.
         for (int i = tid; i < 16 * KEY_TILE; i += NWARPS * 32) {
             const int m = i / KEY_TILE, c = i % KEY_TILE;
             float& score = sS[m * SCORE_STRIDE + c];
-            score = tile_base + c <= qpos[m] ? mass_weight[m] * __expf(scale * score - LSE[m]) : 0.0f;
+            score = tile_base + c <= qpos[m] ? mass_weight[m] * __expf(p.scale * score - LSE[m]) : 0.0f;
         }
         __syncthreads();
 
@@ -346,24 +338,10 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
                 ms += sS[m * SCORE_STRIDE + c];
             }
             if (ms > 0.0f) {
-                // tile_pages is a register array, so the page it selects has to
-                // be a compile-time index.
-                int phys = tile_pages[0];
-#pragma unroll
-                for (int p = 1; p < KEY_PAGES; ++p) {
-                    if (c / PAGE_SIZE == p) {
-                        phys = tile_pages[p];
-                    }
-                }
-                const int64_t mass_idx = (static_cast<int64_t>(phys) * PAGE_SIZE + c % PAGE_SIZE) * n_q_heads + h;
-                atomicAdd(&mass_pool[mass_idx], mass_decay * ms);
+                atomicAdd(&mass[static_cast<int64_t>(tile_base + c) * p.n_q_heads + h], mass_decay * ms);
             }
         }
         __syncthreads();
-#pragma unroll
-        for (int p = 0; p < KEY_PAGES; ++p) {
-            tile_pages[p] = next_pages[p];
-        }
     }
 }
 

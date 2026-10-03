@@ -44,6 +44,7 @@ at::Tensor paged_attention(
     int64_t layer,
     const GroupBatch& g,
     double scale,
+    double rope_theta,
     const at::Tensor& lse_capture = {}
 );
 

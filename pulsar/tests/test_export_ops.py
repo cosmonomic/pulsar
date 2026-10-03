@@ -29,14 +29,6 @@ def _rope_case(dtype):
     return (x, pos, 1000000.0), {}
 
 
-def _attention_case(dtype):
-    q = torch.randn(2, 2, 8, device="cuda", dtype=dtype)
-    k = torch.randn(2, 4, 8, device="cuda", dtype=dtype)
-    v = torch.randn(2, 4, 8, device="cuda", dtype=dtype)
-    attention_mass = torch.zeros(2, 4, device="cuda", dtype=torch.float32)
-    return (q, k, v, attention_mass, 0.35, 0), {}
-
-
 def test_opcheck_rmsnorm():
     for dtype in (torch.float32, torch.bfloat16):
         x = torch.randn(4, 8, device="cuda", dtype=dtype)
@@ -54,34 +46,17 @@ def test_opcheck_rope():
         )
 
 
-def test_opcheck_attn_causal():
-    for dtype in (torch.float32, torch.bfloat16):
-        args, kwargs = _attention_case(dtype)
-        torch.library.opcheck(
-            torch.ops.pulsar.attn_causal,
-            args,
-            kwargs,
-            test_utils=_OPCHECK_UTILS,
-        )
-
-
 class _AllOps(torch.nn.Module):
-    def forward(self, x, weight, pos, q, k, v, attention_mass):
+    def forward(self, x, weight, pos):
         h = torch.ops.pulsar.rmsnorm(x, weight, 1e-6)
-        h = torch.ops.pulsar.rope(h, pos, 1000000.0)
-        o, mass = torch.ops.pulsar.attn_causal(q, k, v, attention_mass, 0.35, 0)
-        return o, mass, h
+        return torch.ops.pulsar.rope(h, pos, 1000000.0)
 
 
 def _export_inputs():
     x = torch.randn(2, 4, 8, device="cuda", dtype=torch.float32)
     weight = torch.randn(8, device="cuda", dtype=torch.float32)
     pos = torch.arange(4, device="cuda", dtype=torch.int64)
-    q = torch.randn(2, 2, 8, device="cuda", dtype=torch.float32)
-    k = torch.randn(2, 4, 8, device="cuda", dtype=torch.float32)
-    v = torch.randn(2, 4, 8, device="cuda", dtype=torch.float32)
-    attention_mass = torch.zeros(2, 4, device="cuda", dtype=torch.float32)
-    return (x, weight, pos, q, k, v, attention_mass)
+    return (x, weight, pos)
 
 
 def _exported_pulsar_targets(ep):
@@ -99,7 +74,6 @@ def test_export_smoke():
     targets = _exported_pulsar_targets(ep)
     assert any("rmsnorm" in t for t in targets)
     assert any("rope" in t for t in targets)
-    assert any("attn_causal" in t for t in targets)
 
 
 if __name__ == "__main__":
@@ -111,7 +85,6 @@ if __name__ == "__main__":
     for name, fn in (
         ("opcheck rmsnorm", test_opcheck_rmsnorm),
         ("opcheck rope", test_opcheck_rope),
-        ("opcheck attn_causal", test_opcheck_attn_causal),
     ):
         try:
             fn()
@@ -127,7 +100,7 @@ if __name__ == "__main__":
         ep = torch.export.export(mod, inputs)
         targets = _exported_pulsar_targets(ep)
         print(f"PASS: export smoke; surviving pulsar op nodes: {targets}")
-        results.append(len(targets) == 3)
+        results.append(len(targets) == 2)
     except Exception as exc:  # noqa: BLE001
         print(f"FAIL: export smoke: {exc}")
         results.append(False)

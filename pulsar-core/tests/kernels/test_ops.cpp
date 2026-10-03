@@ -6,6 +6,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <optional>
@@ -42,6 +44,7 @@ namespace {
 
 constexpr int64_t kPageSize = 16;
 constexpr int64_t kHeadDim = 64;
+constexpr double kTheta = 1e6;
 const double kScale = 1.0 / std::sqrt(static_cast<double>(kHeadDim));
 
 at::Tensor int32_cuda(const std::vector<int32_t>& v) {
@@ -52,9 +55,14 @@ at::Tensor mass_decay(const std::vector<float>& v) {
     return at::tensor(v, at::dtype(at::kFloat)).to(at::kCUDA);
 }
 
-// A key pool of num_pages zeroed pages. Every score is q.k == 0, so a query's
-// attention is uniform over the keys it attends and each key's share is exactly
-// 1 / (keys attended). One kv head, one query head.
+// {0, 0, -1} per sequence: every key at its own view index.
+at::Tensor identity_layout(int64_t num_seqs) {
+    return int32_cuda({0, 0, -1}).repeat({num_seqs, 1});
+}
+
+// A key pool of num_pages zeroed pages. Every score is q.k == 0 at any rotation, so a
+// query's attention is uniform over the keys it attends and each key's share is
+// exactly 1 / (keys attended). One kv head, one query head.
 at::Tensor zero_pool(int64_t num_pages, at::ScalarType dt) {
     return at::zeros({num_pages, kPageSize, 1, kHeadDim}, at::device(at::kCUDA).dtype(dt));
 }
@@ -66,6 +74,73 @@ at::Tensor zero_mass(int64_t num_pages) {
 // Per-page max mass. ActiveBuffer::evict ranks pages by this value.
 double page_mass(const at::Tensor& mass, int64_t page) {
     return mass.select(0, page).max().item<double>();
+}
+
+// Every sequence's view is page_tables row s, its mass rows one view page per table
+// column, so view page b of sequence s is mass row s * max_pages + b.
+at::Tensor row_view_pages(const at::Tensor& page_tables) {
+    const int64_t num_seqs = page_tables.size(0), max_pages = page_tables.size(1);
+    return at::arange(0, (num_seqs + 1) * max_pages, max_pages, at::device(at::kCUDA).dtype(at::kInt));
+}
+
+at::Tensor prefill(
+    const at::Tensor& q,
+    const at::Tensor& k_pool,
+    const at::Tensor& v_pool,
+    const at::Tensor& page_tables,
+    const at::Tensor& cu_seqlens_q,
+    const at::Tensor& seqlens_k,
+    const at::Tensor& mass,
+    const at::Tensor& decay,
+    double mass_length_gain = 0.0,
+    const std::optional<at::Tensor>& lse = std::nullopt
+) {
+    return pulsar::attn_prefill_cuda(
+        q,
+        k_pool,
+        v_pool,
+        page_tables,
+        cu_seqlens_q,
+        seqlens_k,
+        identity_layout(seqlens_k.size(0)),
+        kTheta,
+        kScale,
+        mass,
+        row_view_pages(page_tables),
+        decay,
+        mass_length_gain,
+        lse
+    );
+}
+
+at::Tensor decode(
+    const at::Tensor& q,
+    const at::Tensor& k_pool,
+    const at::Tensor& v_pool,
+    const at::Tensor& page_tables,
+    const at::Tensor& context_lens,
+    const at::Tensor& mass,
+    const at::Tensor& decay,
+    double mass_length_gain = 0.0,
+    const std::optional<at::Tensor>& lse = std::nullopt,
+    int64_t num_splits = 0
+) {
+    return pulsar::attn_decode_cuda(
+        q,
+        k_pool,
+        v_pool,
+        page_tables,
+        context_lens,
+        identity_layout(context_lens.size(0)),
+        kTheta,
+        kScale,
+        mass,
+        row_view_pages(page_tables),
+        decay,
+        mass_length_gain,
+        lse,
+        num_splits
+    );
 }
 
 }  // namespace
@@ -94,15 +169,14 @@ TEST_CASE("prefill mass scales by each query's own causal key count", "[ops][cud
         // query's causal bound would leave a 1/(i+1) factor in every term (key 0 at
         // alpha*ntok * sum_i retention^(ntok-1-i)/(i+1)).
         auto normalized = zero_mass(num_pages);
-        pulsar::attn_prefill_cuda(
+        prefill(
             q,
             k_pool,
             v_pool,
-            normalized,
             page_tables,
             cu_seqlens_q,
             seqlens_k,
-            kScale,
+            normalized,
             mass_decay({static_cast<float>(alpha)})
         );
         auto got = normalized.view({-1}).to(at::kCPU);
@@ -123,7 +197,7 @@ TEST_CASE("normalized decode mass is invariant to the context length", "[ops][cu
     const int64_t short_ctx = 16, long_ctx = 128;
     const int64_t max_pages = long_ctx / kPageSize;
     const int64_t num_pages = 2 * max_pages;
-    const int64_t long_page = max_pages;  // sequence 1's first page
+    const int64_t long_page = max_pages;  // sequence 1's first view page
 
     std::vector<int32_t> tables;
     for (int32_t p = 0; p < 2 * max_pages; ++p) {
@@ -138,16 +212,7 @@ TEST_CASE("normalized decode mass is invariant to the context length", "[ops][cu
         auto q = at::zeros({2, 1, kHeadDim}, at::device(at::kCUDA).dtype(dt));
 
         auto normalized = zero_mass(num_pages);
-        pulsar::attn_decode_cuda(
-            q,
-            k_pool,
-            v_pool,
-            normalized,
-            page_tables,
-            context_lens,
-            kScale,
-            mass_decay({1.0f, 1.0f})
-        );
+        decode(q, k_pool, v_pool, page_tables, context_lens, normalized, mass_decay({1.0f, 1.0f}));
         const double n_short = page_mass(normalized, 0);
         const double n_long = page_mass(normalized, long_page);
         REQUIRE(std::abs(n_short - 1.0) < 1e-4);
@@ -159,16 +224,17 @@ TEST_CASE("normalized decode mass is invariant to the context length", "[ops][cu
     auto v_pool = zero_pool(num_pages, at::kBFloat16);
     auto q = at::zeros({2, 1, kHeadDim}, at::device(at::kCUDA).dtype(at::kBFloat16));
     auto split = zero_mass(num_pages);
-    pulsar::attn_decode_split_cuda(
+    decode(
         q,
         k_pool,
         v_pool,
-        split,
         page_tables,
         context_lens,
-        kScale,
-        /*num_splits=*/2,
-        mass_decay({1.0f, 1.0f})
+        split,
+        mass_decay({1.0f, 1.0f}),
+        0.0,
+        std::nullopt,
+        /*num_splits=*/2
     );
     REQUIRE(std::abs(page_mass(split, 0) - 1.0) < 1e-4);
     REQUIRE(std::abs(page_mass(split, long_page) - 1.0) < 1e-4);
@@ -192,24 +258,25 @@ TEST_CASE("prefill mass takes the caller's length gain", "[ops][cuda]") {
         auto cu_seqlens_q = int32_cuda({0, static_cast<int32_t>(ntok)});
         auto seqlens_k = int32_cuda({static_cast<int32_t>(ntok)});
 
-        // A gain of 0 is the same launch as naming none, so the two must agree BIT for
-        // bit, not within a tolerance.
+        // A gain of 0 is the default, so the two must agree BIT for bit, not within a
+        // tolerance.
         auto implied = zero_mass(num_pages);
-        pulsar::attn_prefill_cuda(q, k_pool, v_pool, implied, page_tables, cu_seqlens_q, seqlens_k, kScale, alpha);
-        auto stated = zero_mass(num_pages);
         pulsar::attn_prefill_cuda(
             q,
             k_pool,
             v_pool,
-            stated,
             page_tables,
             cu_seqlens_q,
             seqlens_k,
+            identity_layout(1),
+            kTheta,
             kScale,
-            alpha,
-            std::nullopt,
-            /*mass_length_gain=*/0.0
+            implied,
+            row_view_pages(page_tables),
+            alpha
         );
+        auto stated = zero_mass(num_pages);
+        prefill(q, k_pool, v_pool, page_tables, cu_seqlens_q, seqlens_k, stated, alpha, /*mass_length_gain=*/0.0);
         REQUIRE(at::equal(implied, stated));
 
         auto base = implied.view({-1}).to(at::kCPU);
@@ -220,19 +287,7 @@ TEST_CASE("prefill mass takes the caller's length gain", "[ops][cuda]") {
         // Gain 1 leaves the plain softmax weight, so a caller holding a CONSTANT
         // length can multiply it in afterwards and land back on the default.
         auto plain = zero_mass(num_pages);
-        pulsar::attn_prefill_cuda(
-            q,
-            k_pool,
-            v_pool,
-            plain,
-            page_tables,
-            cu_seqlens_q,
-            seqlens_k,
-            kScale,
-            alpha,
-            std::nullopt,
-            /*mass_length_gain=*/1.0
-        );
+        prefill(q, k_pool, v_pool, page_tables, cu_seqlens_q, seqlens_k, plain, alpha, /*mass_length_gain=*/1.0);
         auto got = plain.view({-1}).to(at::kCPU);
         const double want = 1.0 / static_cast<double>(ntok);
         for (int64_t j = 0; j < ntok; ++j) {
@@ -241,17 +296,15 @@ TEST_CASE("prefill mass takes the caller's length gain", "[ops][cuda]") {
 
         // Any other gain is that same weight times the gain.
         auto scaled = zero_mass(num_pages);
-        pulsar::attn_prefill_cuda(
+        prefill(
             q,
             k_pool,
             v_pool,
-            scaled,
             page_tables,
             cu_seqlens_q,
             seqlens_k,
-            kScale,
+            scaled,
             alpha,
-            std::nullopt,
             /*mass_length_gain=*/4.0 * ntok
         );
         auto quad = scaled.view({-1}).to(at::kCPU);
@@ -272,7 +325,7 @@ TEST_CASE("decode mass takes the caller's length gain", "[ops][cuda]") {
     const int64_t short_ctx = 16, long_ctx = 128;
     const int64_t max_pages = long_ctx / kPageSize;
     const int64_t num_pages = 2 * max_pages;
-    const int64_t long_page = max_pages;  // sequence 1's first page
+    const int64_t long_page = max_pages;  // sequence 1's first view page
 
     std::vector<int32_t> tables;
     for (int32_t p = 0; p < 2 * max_pages; ++p) {
@@ -288,35 +341,25 @@ TEST_CASE("decode mass takes the caller's length gain", "[ops][cuda]") {
         auto q = at::zeros({2, 1, kHeadDim}, at::device(at::kCUDA).dtype(dt));
 
         auto implied = zero_mass(num_pages);
-        pulsar::attn_decode_cuda(q, k_pool, v_pool, implied, page_tables, context_lens, kScale, alpha);
-        auto stated = zero_mass(num_pages);
         pulsar::attn_decode_cuda(
             q,
             k_pool,
             v_pool,
-            stated,
             page_tables,
             context_lens,
+            identity_layout(2),
+            kTheta,
             kScale,
-            alpha,
-            std::nullopt,
-            /*mass_length_gain=*/0.0
+            implied,
+            row_view_pages(page_tables),
+            alpha
         );
+        auto stated = zero_mass(num_pages);
+        decode(q, k_pool, v_pool, page_tables, context_lens, stated, alpha, /*mass_length_gain=*/0.0);
         REQUIRE(at::equal(implied, stated));
 
         auto plain = zero_mass(num_pages);
-        pulsar::attn_decode_cuda(
-            q,
-            k_pool,
-            v_pool,
-            plain,
-            page_tables,
-            context_lens,
-            kScale,
-            alpha,
-            std::nullopt,
-            /*mass_length_gain=*/1.0
-        );
+        decode(q, k_pool, v_pool, page_tables, context_lens, plain, alpha, /*mass_length_gain=*/1.0);
         REQUIRE(std::abs(page_mass(plain, 0) - 1.0 / short_ctx) < 1e-4);
         REQUIRE(std::abs(page_mass(plain, long_page) - 1.0 / long_ctx) < 1e-4);
     }
@@ -326,18 +369,17 @@ TEST_CASE("decode mass takes the caller's length gain", "[ops][cuda]") {
     auto v_pool = zero_pool(num_pages, at::kBFloat16);
     auto q = at::zeros({2, 1, kHeadDim}, at::device(at::kCUDA).dtype(at::kBFloat16));
     auto split = zero_mass(num_pages);
-    pulsar::attn_decode_split_cuda(
+    decode(
         q,
         k_pool,
         v_pool,
-        split,
         page_tables,
         context_lens,
-        kScale,
-        /*num_splits=*/2,
+        split,
         alpha,
+        /*mass_length_gain=*/1.0,
         std::nullopt,
-        /*mass_length_gain=*/1.0
+        /*num_splits=*/2
     );
     REQUIRE(std::abs(page_mass(split, 0) - 1.0 / short_ctx) < 1e-4);
     REQUIRE(std::abs(page_mass(split, long_page) - 1.0 / long_ctx) < 1e-4);
@@ -370,17 +412,7 @@ TEST_CASE("attention exposes the softmax denominator it used", "[ops][cuda]") {
         auto q = at::zeros({2, 1, kHeadDim}, at::device(at::kCUDA).dtype(dt));
         auto mass = zero_mass(num_pages);
         auto lse = at::zeros({2, 1}, fopts);
-        pulsar::attn_decode_cuda(
-            q,
-            k_pool,
-            v_pool,
-            mass,
-            page_tables,
-            context_lens,
-            kScale,
-            mass_decay({1.0f, 1.0f}),
-            lse
-        );
+        decode(q, k_pool, v_pool, page_tables, context_lens, mass, mass_decay({1.0f, 1.0f}), 0.0, lse);
         auto host = lse.to(at::kCPU);
         CHECK(std::abs(host[0][0].item<double>() - std::log(short_ctx)) < 1e-4);
         CHECK(std::abs(host[1][0].item<double>() - std::log(long_ctx)) < 1e-4);
@@ -393,18 +425,7 @@ TEST_CASE("attention exposes the softmax denominator it used", "[ops][cuda]") {
     auto q = at::zeros({2, 1, kHeadDim}, at::device(at::kCUDA).dtype(at::kBFloat16));
     auto mass = zero_mass(num_pages);
     auto lse = at::zeros({2, 1}, fopts);
-    pulsar::attn_decode_split_cuda(
-        q,
-        k_pool,
-        v_pool,
-        mass,
-        page_tables,
-        context_lens,
-        kScale,
-        /*num_splits=*/2,
-        mass_decay({1.0f, 1.0f}),
-        lse
-    );
+    decode(q, k_pool, v_pool, page_tables, context_lens, mass, mass_decay({1.0f, 1.0f}), 0.0, lse, /*num_splits=*/2);
     auto host = lse.to(at::kCPU);
     CHECK(std::abs(host[0][0].item<double>() - std::log(short_ctx)) < 1e-4);
     CHECK(std::abs(host[1][0].item<double>() - std::log(long_ctx)) < 1e-4);
@@ -432,17 +453,7 @@ TEST_CASE("prefill mass decays at each sequence's own rate", "[ops][cuda]") {
         auto seqlens_k = int32_cuda({static_cast<int32_t>(n), static_cast<int32_t>(n)});
 
         auto mass = zero_mass(2);
-        pulsar::attn_prefill_cuda(
-            q,
-            k_pool,
-            v_pool,
-            mass,
-            page_tables,
-            cu_seqlens_q,
-            seqlens_k,
-            kScale,
-            mass_decay(alphas)
-        );
+        prefill(q, k_pool, v_pool, page_tables, cu_seqlens_q, seqlens_k, mass, mass_decay(alphas));
         auto got = mass.view({2, n}).to(at::kCPU);
         for (int64_t s = 0; s < 2; ++s) {
             const double alpha = alphas[s];
@@ -478,7 +489,7 @@ TEST_CASE("decode mass decays at each sequence's own rate", "[ops][cuda]") {
         auto v_pool = zero_pool(2, dt);
         auto q = at::zeros({2, 1, kHeadDim}, at::device(at::kCUDA).dtype(dt));
         auto mass = zero_mass(2);
-        pulsar::attn_decode_cuda(q, k_pool, v_pool, mass, page_tables, context_lens, kScale, mass_decay(alphas));
+        decode(q, k_pool, v_pool, page_tables, context_lens, mass, mass_decay(alphas));
         auto got = mass.view({2, ctx}).to(at::kCPU);
         for (int64_t s = 0; s < 2; ++s) {
             for (int64_t j = 0; j < ctx; ++j) {
@@ -492,20 +503,183 @@ TEST_CASE("decode mass decays at each sequence's own rate", "[ops][cuda]") {
     auto v_pool = zero_pool(2, at::kBFloat16);
     auto q = at::zeros({2, 1, kHeadDim}, at::device(at::kCUDA).dtype(at::kBFloat16));
     auto split = zero_mass(2);
-    pulsar::attn_decode_split_cuda(
+    decode(
         q,
         k_pool,
         v_pool,
-        split,
         page_tables,
         context_lens,
-        kScale,
-        /*num_splits=*/2,
-        mass_decay(alphas)
+        split,
+        mass_decay(alphas),
+        0.0,
+        std::nullopt,
+        /*num_splits=*/2
     );
     auto got = split.view({2, ctx}).to(at::kCPU);
     for (int64_t s = 0; s < 2; ++s) {
         REQUIRE(std::abs(got[s][0].item<double>() - alphas[s]) < 1e-4);
+    }
+}
+
+namespace {
+
+// One sequence of the shared-lane case: its view over the pool and its RoPE layout.
+struct View {
+    std::vector<int32_t> lanes;
+    int64_t ctx;
+    int64_t seq_q;  // prefill queries, the last seq_q view indices
+    std::array<int32_t, 3> layout;  // {n_sink, working_lo, short_offset}
+
+    int64_t position(int64_t j) const {
+        if (j < this->layout[0]) {
+            return j;
+        }
+        if (j < this->layout[1]) {
+            return this->layout[2];
+        }
+        return this->layout[2] + 1 + j - this->layout[1];
+    }
+};
+
+// ATen reference for one view: its keys rotated to their layout positions by
+// rope_rotate and rounded to the pool dtype as the kernels store them, then causal
+// softmax attention for the query rows at view indices [ctx - rows, ctx). Fills o
+// rows and adds alpha-graded, length-gained mass into the view's own rows.
+void reference_view(
+    const View& view,
+    const at::Tensor& q,
+    const at::Tensor& k_pool,
+    const at::Tensor& v_pool,
+    int64_t rows,
+    int64_t q_offset,
+    double alpha,
+    at::Tensor& o,
+    at::Tensor& mass_rows
+) {
+    const int64_t n_kv = k_pool.size(2), head_dim = k_pool.size(3);
+    const int64_t group = q.size(1) / n_kv;
+    auto lanes = at::tensor(view.lanes, at::dtype(at::kLong)).to(at::kCUDA);
+    auto k = k_pool.index_select(0, lanes).view({-1, n_kv, head_dim}).slice(0, 0, view.ctx).to(at::kFloat);
+    auto v = v_pool.index_select(0, lanes).view({-1, n_kv, head_dim}).slice(0, 0, view.ctx).to(at::kFloat);
+    std::vector<int64_t> positions(view.ctx);
+    for (int64_t j = 0; j < view.ctx; ++j) {
+        positions[j] = view.position(j);
+    }
+    auto pos = at::tensor(positions, at::dtype(at::kLong)).to(at::kCUDA).view({-1, 1});
+    k = pulsar::rope_rotate(k, pos, kTheta).to(k_pool.scalar_type()).to(at::kFloat);
+
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t p = view.ctx - rows + r;
+        const double graded = alpha * std::pow(1.0 - alpha, static_cast<double>(rows - 1 - r)) * (p + 1);
+        for (int64_t h = 0; h < q.size(1); ++h) {
+            const int64_t g = h / group;
+            auto keys = k.slice(0, 0, p + 1).select(1, g);
+            auto values = v.slice(0, 0, p + 1).select(1, g);
+            auto w = at::softmax(at::mv(keys, q[q_offset + r][h].to(at::kFloat)) * kScale, 0);
+            o[q_offset + r][h] = at::mv(values.t(), w);
+            mass_rows.slice(0, 0, p + 1).select(1, h).add_(w * graded);
+        }
+    }
+}
+
+}  // namespace
+
+// Two views share lane 2: a full page of the second view, the partial tail of the
+// first. The first view is laid out contiguously, the second compacted, so the shared
+// lane's keys sit at different positions in each and must be rotated per view, and its
+// mass must land in each view's own rows. The reference rotates the unrotated pool with
+// the ATen rope_rotate.
+TEST_CASE("views sharing a lane rotate and accumulate apart", "[ops][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const int64_t n_q = 4, n_kv = 2, num_lanes = 3;
+    const std::vector<View> views = {
+        View{{0, 2}, kPageSize + 5, 5, {0, 0, -1}},
+        View{{1, 2, 0}, 2 * kPageSize + 7, 20, {4, 2 * kPageSize + 7 - 18, 6}},
+    };
+    const double alpha = 0.5;
+    const int64_t max_pages = 3, total_view_pages = 2 * max_pages;
+
+    std::vector<int32_t> tables(views.size() * max_pages, 0);
+    std::vector<int32_t> layouts, seqlens, cu_q{0}, cu_view;
+    for (size_t s = 0; s < views.size(); ++s) {
+        std::copy(views[s].lanes.begin(), views[s].lanes.end(), tables.begin() + s * max_pages);
+        layouts.insert(layouts.end(), views[s].layout.begin(), views[s].layout.end());
+        seqlens.push_back(static_cast<int32_t>(views[s].ctx));
+        cu_q.push_back(cu_q.back() + static_cast<int32_t>(views[s].seq_q));
+        cu_view.push_back(static_cast<int32_t>(s * max_pages));
+    }
+    cu_view.push_back(static_cast<int32_t>(total_view_pages));
+    auto page_tables = int32_cuda(tables).view({2, max_pages});
+    auto rope_layout = int32_cuda(layouts).view({2, 3});
+    auto seqlens_k = int32_cuda(seqlens);
+    auto cu_seqlens_q = int32_cuda(cu_q);
+    auto cu_view_pages = int32_cuda(cu_view);
+    auto decay = mass_decay({static_cast<float>(alpha), static_cast<float>(alpha)});
+    auto new_mass = [&] {
+        return at::zeros({total_view_pages, kPageSize, n_q}, at::device(at::kCUDA).dtype(at::kFloat));
+    };
+
+    for (auto dt : {at::kFloat, at::kBFloat16}) {  // scalar then tensor-core kernels
+        at::manual_seed(7);
+        auto opts = at::device(at::kCUDA).dtype(dt);
+        auto k_pool = at::randn({num_lanes, kPageSize, n_kv, kHeadDim}, opts);
+        auto v_pool = at::randn({num_lanes, kPageSize, n_kv, kHeadDim}, opts);
+        const double o_tol = dt == at::kFloat ? 1e-4 : 2e-2;
+
+        auto q_pre = at::randn({cu_q.back(), n_q, kHeadDim}, opts);
+        auto o_pre = at::zeros({cu_q.back(), n_q, kHeadDim}, at::device(at::kCUDA).dtype(at::kFloat));
+        auto mass_pre = new_mass();
+        auto q_dec = at::randn({2, n_q, kHeadDim}, opts);
+        auto o_dec = at::zeros({2, n_q, kHeadDim}, at::device(at::kCUDA).dtype(at::kFloat));
+        auto mass_dec = new_mass();
+        for (size_t s = 0; s < views.size(); ++s) {
+            auto pre_rows = mass_pre.slice(0, s * max_pages, (s + 1) * max_pages).view({-1, n_q});
+            reference_view(views[s], q_pre, k_pool, v_pool, views[s].seq_q, cu_q[s], alpha, o_pre, pre_rows);
+            auto dec_rows = mass_dec.slice(0, s * max_pages, (s + 1) * max_pages).view({-1, n_q});
+            reference_view(views[s], q_dec, k_pool, v_pool, 1, s, alpha, o_dec, dec_rows);
+        }
+
+        auto mass = new_mass();
+        auto o = pulsar::attn_prefill_cuda(
+            q_pre,
+            k_pool,
+            v_pool,
+            page_tables,
+            cu_seqlens_q,
+            seqlens_k,
+            rope_layout,
+            kTheta,
+            kScale,
+            mass,
+            cu_view_pages,
+            decay
+        );
+        CHECK(at::allclose(o.to(at::kFloat), o_pre, o_tol, o_tol));
+        CHECK(at::allclose(mass, mass_pre, 1e-3, 1e-3));
+
+        for (int64_t num_splits : {0, 1, 2}) {
+            auto dec_mass = new_mass();
+            auto dec_o = pulsar::attn_decode_cuda(
+                q_dec,
+                k_pool,
+                v_pool,
+                page_tables,
+                seqlens_k,
+                rope_layout,
+                kTheta,
+                kScale,
+                dec_mass,
+                cu_view_pages,
+                decay,
+                0.0,
+                std::nullopt,
+                num_splits
+            );
+            CHECK(at::allclose(dec_o.to(at::kFloat), o_dec, o_tol, o_tol));
+            CHECK(at::allclose(dec_mass, mass_dec, 1e-3, 1e-3));
+        }
     }
 }
 

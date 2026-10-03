@@ -105,7 +105,7 @@ at::Tensor Qwen3Model::block(at::Tensor x, int64_t layer, const GroupBatch& g, A
     if (this->capture_layers.count(layer)) {
         lse = at::empty({ntok, this->n_heads}, at::device(x.device()).dtype(at::kFloat));
     }
-    auto o = paged_attention(q, k, v, kv, layer, g, this->scale, lse);
+    auto o = paged_attention(q, k, v, kv, layer, g, this->scale, this->rope_theta, lse);
     if (lse.defined()) {
         (g.is_prefill() ? this->lse_prefill : this->lse_decode)[layer] = lse;
     }

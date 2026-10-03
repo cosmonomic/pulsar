@@ -35,45 +35,47 @@ at::Tensor paged_attention(
     int64_t layer,
     const GroupBatch& g,
     double scale,
+    double rope_theta,
     const at::Tensor& lse_capture
 ) {
     auto k_pool = kv.k_pool(layer);
     auto v_pool = kv.v_pool(layer);
-    auto mass_pool = kv.mass_pool(layer);
-    // Prefill pays a whole second streaming pass for mass, so a layer nothing reduces
-    // over hands the op an undefined pool and skips it. Decode's mass rides in its
-    // single pass and stays unconditional.
-    auto prefill_mass = kv.mass_is_read(layer) ? mass_pool : at::Tensor{};
     write_kv_cuda(k_pool, v_pool, k, v, g.slot_mapping);
-    // The attention-mass EMA gain alpha is per SEQUENCE (g.attention_mass_decay, one
-    // entry per group row); the prefill within-chunk grading derives its retention
-    // 1 - alpha from the same entry.
+    const int64_t num_seqs = g.page_tables.size(0);
+    const auto identity_layout = at::tensor({0, 0, -1}, at::dtype(at::kInt)).to(k_pool.device()).repeat({num_seqs, 1});
+    const auto lse = lse_capture.defined() ? std::optional<at::Tensor>(lse_capture) : std::nullopt;
     if (g.is_prefill()) {
         return attn_prefill_cuda(
             q,
             k_pool,
             v_pool,
-            prefill_mass,
             g.page_tables,
             g.cu_seqlens_q,
             g.seqlens_k,
+            identity_layout,
+            rope_theta,
             scale,
-            g.attention_mass_decay,
-            lse_capture.defined() ? std::optional<at::Tensor>(lse_capture) : std::nullopt,
-            g.mass_length_gain
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            g.mass_length_gain,
+            lse
         );
     }
     return attn_decode_cuda(
         q,
         k_pool,
         v_pool,
-        mass_pool,
         g.page_tables,
         g.context_lens,
+        identity_layout,
+        rope_theta,
         scale,
-        g.attention_mass_decay,
-        lse_capture.defined() ? std::optional<at::Tensor>(lse_capture) : std::nullopt,
-        g.mass_length_gain
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        g.mass_length_gain,
+        lse
     );
 }
 
