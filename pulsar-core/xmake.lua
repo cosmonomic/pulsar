@@ -3,6 +3,9 @@ set_xmakever("3.0.0")
 
 add_rules("mode.release", "mode.debug")
 set_defaultmode("debug")
+set_policy("build.optimization.lto", true)
+add_ldflags("-flto=auto")
+add_shflags("-flto=auto")
 
 option("torch_cmake_prefix", {default = "", description = "Torch's CMake prefix path, used to configure libtorch."})
 option("prof", {default = false, description = "Compile the PULSAR_PROF phase timers into the engine."})

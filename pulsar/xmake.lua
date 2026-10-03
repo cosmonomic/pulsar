@@ -1,6 +1,9 @@
 includes(os.isdir(path.join(os.scriptdir(), "pulsar-core")) and "pulsar-core" or "../pulsar-core")
 
 set_project("pulsar")
+set_policy("build.optimization.lto", true)
+add_ldflags("-flto=auto")
+add_shflags("-flto=auto")
 
 option("torch_cmake_prefix")
     after_check(function (option)
