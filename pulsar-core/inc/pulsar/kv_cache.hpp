@@ -36,6 +36,7 @@ enum class page_error { miss, oom };
 template <page_store t_store> class kv_cache {
   private:
     struct line;
+    struct fetch;
 
     at::Tensor k;  // [n_layers, n_lines, page_size, n_kv_heads, head_dim]
     at::Tensor v;
@@ -43,7 +44,7 @@ template <page_store t_store> class kv_cache {
     std::vector<line> lines;
     std::unordered_map<digest, std::uint32_t, digest_hash> digest_to_line_id;
     // Pages a get is fetching into a line, not yet in digest_to_line_id.
-    std::unordered_map<digest, std::uint32_t, digest_hash> fetching;
+    std::unordered_map<digest, fetch, digest_hash> fetching;
     t_store store;
 
   public:
@@ -84,6 +85,12 @@ template <page_store t_store> struct kv_cache<t_store>::line {
     std::optional<digest> hash;
     std::uint64_t last_released;
     std::uint32_t ref;
+};
+
+// done is set when the fetch completes. The page arrived when its line's hash then equals its digest.
+template <page_store t_store> struct kv_cache<t_store>::fetch {
+    std::uint32_t line_id;
+    event done;
 };
 
 }  // namespace pulsar
