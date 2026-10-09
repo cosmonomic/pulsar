@@ -250,11 +250,11 @@ def attn_decode(
 
     Args:
         q: Query tokens, [num_seqs, n_q_heads, head_dim].
-        k_pool: Key pool, [num_lanes, page_size, n_kv_heads, head_dim], UNROTATED.
+        k_pool: Key pool, [num_lines, page_size, n_kv_heads, head_dim], UNROTATED.
         v_pool: Value pool, same shape as k_pool.
-        page_tables: int32 [num_seqs, max_pages]. page_tables[s][b] is the lane
+        page_tables: int32 [num_seqs, max_pages]. page_tables[s][b] is the line
             holding view page b of sequence s; key index j lives at
-            (page_tables[s][j // page_size], j % page_size). A lane may appear in
+            (page_tables[s][j // page_size], j % page_size). A line may appear in
             several views.
         context_lens: int32 [num_seqs]. Number of keys in each view.
         rope_layout: int32 [num_seqs, 3], {n_sink, working_lo, short_offset} per
@@ -266,7 +266,7 @@ def attn_decode(
         mass: fp32 [total_view_pages, page_size, n_q_heads], mutated in place.
             Sequence s's key j adds its normalized weight into row
             (cu_view_pages[s] + j // page_size, j % page_size), each query head into
-            its own column, so views sharing a lane accumulate apart. None skips the
+            its own column, so views sharing a line accumulate apart. None skips the
             mass pass; cu_view_pages and attention_mass_decay then go unread.
         cu_view_pages: int32 [num_seqs + 1]. Sequence s owns view pages
             [cu_view_pages[s], cu_view_pages[s+1]), at least as many as its context
@@ -322,11 +322,11 @@ def attn_prefill(
 
     Args:
         q: Query tokens, [total_q, n_q_heads, head_dim].
-        k_pool: Key pool, [num_lanes, page_size, n_kv_heads, head_dim], UNROTATED.
+        k_pool: Key pool, [num_lines, page_size, n_kv_heads, head_dim], UNROTATED.
         v_pool: Value pool, same shape as k_pool.
-        page_tables: int32 [num_seqs, max_pages]. page_tables[s][b] is the lane
+        page_tables: int32 [num_seqs, max_pages]. page_tables[s][b] is the line
             holding view page b of sequence s; key index j lives at
-            (page_tables[s][j // page_size], j % page_size). A lane may appear in
+            (page_tables[s][j // page_size], j % page_size). A line may appear in
             several views.
         cu_seqlens_q: int32 [num_seqs+1]. Prefix sums of per-seq query lengths.
         seqlens_k: int32 [num_seqs]. Keys in each view (>= its query length).
@@ -339,7 +339,7 @@ def attn_prefill(
         mass: fp32 [total_view_pages, page_size, n_q_heads], mutated in place.
             Sequence s's key j adds its normalized weight into row
             (cu_view_pages[s] + j // page_size, j % page_size), each query head into
-            its own column, so views sharing a lane accumulate apart. None skips the
+            its own column, so views sharing a line accumulate apart. None skips the
             mass pass; cu_view_pages and attention_mass_decay then go unread.
         cu_view_pages: int32 [num_seqs + 1]. Sequence s owns view pages
             [cu_view_pages[s], cu_view_pages[s+1]), at least as many as its context

@@ -523,9 +523,9 @@ TEST_CASE("decode mass decays at each sequence's own rate", "[ops][cuda]") {
 
 namespace {
 
-// One sequence of the shared-lane case: its view over the pool and its RoPE layout.
+// One sequence of the shared-line case: its view over the pool and its RoPE layout.
 struct View {
-    std::vector<int32_t> lanes;
+    std::vector<int32_t> lines;
     int64_t ctx;
     int64_t seq_q;  // prefill queries, the last seq_q view indices
     std::array<int32_t, 3> layout;  // {n_sink, working_lo, short_offset}
@@ -558,9 +558,9 @@ void reference_view(
 ) {
     const int64_t n_kv = k_pool.size(2), head_dim = k_pool.size(3);
     const int64_t group = q.size(1) / n_kv;
-    auto lanes = at::tensor(view.lanes, at::dtype(at::kLong)).to(at::kCUDA);
-    auto k = k_pool.index_select(0, lanes).view({-1, n_kv, head_dim}).slice(0, 0, view.ctx).to(at::kFloat);
-    auto v = v_pool.index_select(0, lanes).view({-1, n_kv, head_dim}).slice(0, 0, view.ctx).to(at::kFloat);
+    auto lines = at::tensor(view.lines, at::dtype(at::kLong)).to(at::kCUDA);
+    auto k = k_pool.index_select(0, lines).view({-1, n_kv, head_dim}).slice(0, 0, view.ctx).to(at::kFloat);
+    auto v = v_pool.index_select(0, lines).view({-1, n_kv, head_dim}).slice(0, 0, view.ctx).to(at::kFloat);
     std::vector<int64_t> positions(view.ctx);
     for (int64_t j = 0; j < view.ctx; ++j) {
         positions[j] = view.position(j);
@@ -584,16 +584,16 @@ void reference_view(
 
 }  // namespace
 
-// Two views share lane 2: a full page of the second view, the partial tail of the
+// Two views share line 2: a full page of the second view, the partial tail of the
 // first. The first view is laid out contiguously, the second compacted, so the shared
-// lane's keys sit at different positions in each and must be rotated per view, and its
+// line's keys sit at different positions in each and must be rotated per view, and its
 // mass must land in each view's own rows. The reference rotates the unrotated pool with
 // the ATen rope_rotate.
-TEST_CASE("views sharing a lane rotate and accumulate apart", "[ops][cuda]") {
+TEST_CASE("views sharing a line rotate and accumulate apart", "[ops][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }
-    const int64_t n_q = 4, n_kv = 2, num_lanes = 3;
+    const int64_t n_q = 4, n_kv = 2, num_lines = 3;
     const std::vector<View> views = {
         View{{0, 2}, kPageSize + 5, 5, {0, 0, -1}},
         View{{1, 2, 0}, 2 * kPageSize + 7, 20, {4, 2 * kPageSize + 7 - 18, 6}},
@@ -604,7 +604,7 @@ TEST_CASE("views sharing a lane rotate and accumulate apart", "[ops][cuda]") {
     std::vector<int32_t> tables(views.size() * max_pages, 0);
     std::vector<int32_t> layouts, seqlens, cu_q{0}, cu_view;
     for (size_t s = 0; s < views.size(); ++s) {
-        std::copy(views[s].lanes.begin(), views[s].lanes.end(), tables.begin() + s * max_pages);
+        std::copy(views[s].lines.begin(), views[s].lines.end(), tables.begin() + s * max_pages);
         layouts.insert(layouts.end(), views[s].layout.begin(), views[s].layout.end());
         seqlens.push_back(static_cast<int32_t>(views[s].ctx));
         cu_q.push_back(cu_q.back() + static_cast<int32_t>(views[s].seq_q));
@@ -624,8 +624,8 @@ TEST_CASE("views sharing a lane rotate and accumulate apart", "[ops][cuda]") {
     for (auto dt : {at::kFloat, at::kBFloat16}) {  // scalar then tensor-core kernels
         at::manual_seed(7);
         auto opts = at::device(at::kCUDA).dtype(dt);
-        auto k_pool = at::randn({num_lanes, kPageSize, n_kv, kHeadDim}, opts);
-        auto v_pool = at::randn({num_lanes, kPageSize, n_kv, kHeadDim}, opts);
+        auto k_pool = at::randn({num_lines, kPageSize, n_kv, kHeadDim}, opts);
+        auto v_pool = at::randn({num_lines, kPageSize, n_kv, kHeadDim}, opts);
         const double o_tol = dt == at::kFloat ? 1e-4 : 2e-2;
 
         auto q_pre = at::randn({cu_q.back(), n_q, kHeadDim}, opts);

@@ -5,7 +5,7 @@ keys; the op rotates each to its position under the sequence's RoPE layout and
 accumulates a per-key mass into the sequence's own view rows.
 
 These tests compare against a plain-PyTorch reference that rotates the gathered
-keys with ops.rope, over shuffled lanes where two views share a lane, under both
+keys with ops.rope, over shuffled lines where two views share a line, under both
 the contiguous and the compacted layout. For fp16/bf16, attn_decode's tensor-core
 result is also checked against the scalar reference op per mass slot (not just
 aggregate error), so a wrong fragment-to-slot mapping cannot hide behind an
@@ -120,8 +120,8 @@ def _check_write(dtype, page_size):
 
 
 def _build_views(head_cfg, page_size, context_lens, dtype, seed):
-    """Builds a pool of unrotated K/V and one view per sequence over shuffled lanes.
-    View 1 takes view 0's first lane as its own first page, so the two share it at
+    """Builds a pool of unrotated K/V and one view per sequence over shuffled lines.
+    View 1 takes view 0's first line as its own first page, so the two share it at
     different view positions; odd sequences use the compacted layout."""
     torch.manual_seed(seed)
     n_q_heads, n_kv_heads, head_dim = head_cfg
@@ -129,19 +129,19 @@ def _build_views(head_cfg, page_size, context_lens, dtype, seed):
 
     per_seq_pages = [_pages_needed(c, page_size) for c in context_lens]
     max_pages = max(per_seq_pages)
-    total_pages = sum(per_seq_pages) + 3  # a few spare lanes
+    total_pages = sum(per_seq_pages) + 3  # a few spare lines
 
     perm = torch.randperm(total_pages).tolist()
-    seq_lanes = []
+    seq_lines = []
     cursor = 0
     for nb in per_seq_pages:
-        seq_lanes.append(perm[cursor : cursor + nb])
+        seq_lines.append(perm[cursor : cursor + nb])
         cursor += nb
     if num_seqs > 1:
-        seq_lanes[1][0] = seq_lanes[0][0]
+        seq_lines[1][0] = seq_lines[0][0]
     page_tables = torch.zeros(num_seqs, max_pages, dtype=torch.int32)
-    for s, lanes in enumerate(seq_lanes):
-        page_tables[s, : len(lanes)] = torch.tensor(lanes, dtype=torch.int32)
+    for s, lines in enumerate(seq_lines):
+        page_tables[s, : len(lines)] = torch.tensor(lines, dtype=torch.int32)
 
     layouts = [_layout(ctx, s % 2 == 1) for s, ctx in enumerate(context_lens)]
     cu_view_pages = [0]
@@ -163,7 +163,7 @@ def _build_views(head_cfg, page_size, context_lens, dtype, seed):
         context_lens=torch.tensor(context_lens, dtype=torch.int32, device="cuda"),
         rope_layout=torch.tensor(layouts, dtype=torch.int32, device="cuda"),
         cu_view_pages=torch.tensor(cu_view_pages, dtype=torch.int32, device="cuda"),
-        seq_lanes=seq_lanes,
+        seq_lines=seq_lines,
         layouts=layouts,
         total_view_pages=cu_view_pages[-1],
     )
@@ -175,9 +175,9 @@ def _view_kv(views, s, ctx):
     [ctx, n_kv_heads, head_dim]."""
     k_pool, v_pool = views["k_pool"], views["v_pool"]
     n_kv_heads, head_dim = k_pool.shape[2], k_pool.shape[3]
-    lanes = torch.tensor(views["seq_lanes"][s], device="cuda")
-    k = k_pool[lanes].reshape(-1, n_kv_heads, head_dim)[:ctx]
-    v = v_pool[lanes].reshape(-1, n_kv_heads, head_dim)[:ctx]
+    lines = torch.tensor(views["seq_lines"][s], device="cuda")
+    k = k_pool[lines].reshape(-1, n_kv_heads, head_dim)[:ctx]
+    v = v_pool[lines].reshape(-1, n_kv_heads, head_dim)[:ctx]
     pos = torch.tensor(
         _positions(views["layouts"][s], ctx), dtype=torch.int64, device="cuda"
     )

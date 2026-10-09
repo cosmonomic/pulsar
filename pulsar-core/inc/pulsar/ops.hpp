@@ -27,9 +27,9 @@ void write_kv_cuda(
     const at::Tensor& slot_mapping
 );
 
-// Paged attention over a batch of sequences, each a VIEW: an ordered list of lanes
+// Paged attention over a batch of sequences, each a VIEW: an ordered list of lines
 // (page_size-key pages) of the shared pool. Key index j of sequence s lives at
-// (page_tables[s][j / page_size], j % page_size). A lane may appear in several views.
+// (page_tables[s][j / page_size], j % page_size). A line may appear in several views.
 //
 // The pool holds UNROTATED keys. The op rotates key j of sequence s to the RoPE
 // position rope_layout[s] gives index j, in the HF/Qwen2 rotate_half convention over
@@ -45,7 +45,7 @@ void write_kv_cuda(
 // mass, when given, receives each attended key's normalized softmax weight, added into
 // the QUERY head's own column (no sum over the group), at the key's VIEW row:
 // sequence s's key j accumulates into mass[cu_view_pages[s] + j / page_size,
-// j % page_size, h]. Views therefore never share mass, whatever lanes they share.
+// j % page_size, h]. Views therefore never share mass, whatever lines they share.
 //   mass                 fp32 [total_view_pages, page_size, n_q_heads], mutated in place
 //   cu_view_pages        int32 [num_seqs + 1]; sequence s owns view pages
 //                        [cu_view_pages[s], cu_view_pages[s+1]), at least its context's

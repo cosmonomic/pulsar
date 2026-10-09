@@ -133,12 +133,12 @@ __device__ __forceinline__ void tc_attend_tiles(
         if (valid <= 0) {
             break;
         }
-        const int64_t lane_base = (static_cast<int64_t>(seq_table[t]) * PAGE_SIZE * p.n_kv_heads + g) * HEAD_DIM;
+        const int64_t line_base = (static_cast<int64_t>(seq_table[t]) * PAGE_SIZE * p.n_kv_heads + g) * HEAD_DIM;
         for (int i = tid; i < PAGE_SIZE * HALF; i += NWARPS * 32) {
             const int off = i / HALF;
             scalar_t lo = static_cast<scalar_t>(0), hi = static_cast<scalar_t>(0);
             if (off < valid) {
-                const scalar_t* krow = p.k_pool + lane_base + off * stride_slot;
+                const scalar_t* krow = p.k_pool + line_base + off * stride_slot;
                 float cos_a, sin_a;
                 attn::rope_sincos_turns(layout.position(tile_base + off), turns, cos_a, sin_a);
                 const auto k = attn::rope_rotate<scalar_t>(
@@ -155,7 +155,7 @@ __device__ __forceinline__ void tc_attend_tiles(
         }
         for (int i = tid; i < PAGE_SIZE * HEAD_DIM; i += NWARPS * 32) {
             const int off = i / HEAD_DIM, d = i % HEAD_DIM;
-            sV[i] = off < valid ? p.v_pool[lane_base + off * stride_slot + d] : static_cast<scalar_t>(0);
+            sV[i] = off < valid ? p.v_pool[line_base + off * stride_slot + d] : static_cast<scalar_t>(0);
         }
         __syncthreads();
 

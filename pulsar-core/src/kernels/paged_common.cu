@@ -61,8 +61,8 @@ template <typename scalar_t, int PAGE_SIZE> __global__ void attn_scalar_kernel(c
     __syncthreads();
 
     auto key_offset = [&](int j) {
-        const int lane = seq_table[j / PAGE_SIZE];
-        return ((static_cast<int64_t>(lane) * PAGE_SIZE + j % PAGE_SIZE) * p.n_kv_heads + g) * head_dim;
+        const int line = seq_table[j / PAGE_SIZE];
+        return ((static_cast<int64_t>(line) * PAGE_SIZE + j % PAGE_SIZE) * p.n_kv_heads + g) * head_dim;
     };
     auto score = [&](int j, int64_t offset) {
         const scalar_t* krow = p.k_pool + offset;
@@ -184,7 +184,7 @@ PagedAttnBatch paged_attn_batch(
     TORCH_CHECK(
         k_pool.dim() == 4 && k_pool.sizes() == v_pool.sizes(),
         op,
-        ": k_pool and v_pool must be 4-D [num_lanes, page_size, n_kv_heads, head_dim] of one shape"
+        ": k_pool and v_pool must be 4-D [num_lines, page_size, n_kv_heads, head_dim] of one shape"
     );
     TORCH_CHECK(k_pool.is_contiguous() && v_pool.is_contiguous(), op, ": pools must be contiguous");
 

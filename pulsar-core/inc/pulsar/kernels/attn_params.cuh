@@ -11,7 +11,7 @@
 // in the mass output.
 //
 // The pool holds UNROTATED keys. A key's position is a function of its index j in the
-// sequence's view (page table order) alone, so a lane shared by several views takes
+// sequence's view (page table order) alone, so a line shared by several views takes
 // each view's own position, and the kernels rotate every key as they read it. Queries
 // arrive already rotated.
 
@@ -20,8 +20,8 @@ namespace attn {
 
 template <typename scalar_t> struct PagedAttnParams {
     const scalar_t* q;  // [total_q, n_q_heads, head_dim], rotated
-    const scalar_t* k_pool;  // [num_lanes, page_size, n_kv_heads, head_dim], unrotated
-    const scalar_t* v_pool;  // [num_lanes, page_size, n_kv_heads, head_dim]
+    const scalar_t* k_pool;  // [num_lines, page_size, n_kv_heads, head_dim], unrotated
+    const scalar_t* v_pool;  // [num_lines, page_size, n_kv_heads, head_dim]
     const int32_t* page_tables;  // [num_seqs, max_pages]
     const int32_t* cu_seqlens_q;  // [num_seqs + 1]; null when each sequence has one query
     const int32_t* seqlens_k;  // [num_seqs]
@@ -122,7 +122,7 @@ __device__ __forceinline__ RotatedPair<scalar_t> rope_rotate(float lo, float hi,
 }
 
 // Sequence s's rows of the mass output: key index j's row is cu_view_pages[s] *
-// page_size + j, so two views sharing a lane accumulate apart.
+// page_size + j, so two views sharing a line accumulate apart.
 template <typename scalar_t>
 __device__ __forceinline__ float* seq_mass(const PagedAttnParams<scalar_t>& p, int s, int ctx_len, int page_size) {
     const int first = p.cu_view_pages[s];

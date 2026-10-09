@@ -142,17 +142,17 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
             ? (chunk_end_offset == 0 ? 1.0f : __powf(retention, static_cast<float>(chunk_end_offset))) * attended_len
             : 0.0f;
     }
-    // The pages of key tile t, in the pool (lanes, for V) and in rotated_k (sequence
+    // The pages of key tile t, in the pool (lines, for V) and in rotated_k (sequence
     // s's view page b is page s * max_pages + b, for K). The staging address
     // arithmetic is a 64-bit multiply chain off these, so they are read a whole
     // iteration before the stage_tile that consumes them. A tile may reach past the
     // sequence's last page; seq_table is only populated up to it.
-    auto load_pages = [&](int t, int* lanes, int* key_pages) {
+    auto load_pages = [&](int t, int* lines, int* key_pages) {
 #pragma unroll
         for (int kp = 0; kp < KEY_PAGES; ++kp) {
             const int page_base = t * KEY_TILE + kp * PAGE_SIZE;
             const bool in_view = t < n_key_tiles && page_base < ctx_len;
-            lanes[kp] = in_view ? seq_table[t * KEY_PAGES + kp] : 0;
+            lines[kp] = in_view ? seq_table[t * KEY_PAGES + kp] : 0;
             key_pages[kp] = in_view ? s * p.max_pages + t * KEY_PAGES + kp : 0;
         }
     };
@@ -187,16 +187,16 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
     // the bottom, so each is staged one full iteration ahead of its use: K right
     // after the QKᵀ that frees its tile, V right after that PV. Two groups are in
     // flight at every wait, oldest first, so both waits leave one outstanding.
-    int tile_lanes[KEY_PAGES], next_lanes[KEY_PAGES], tile_keys[KEY_PAGES], next_keys[KEY_PAGES];
-    load_pages(0, tile_lanes, tile_keys);
+    int tile_lines[KEY_PAGES], next_lines[KEY_PAGES], tile_keys[KEY_PAGES], next_keys[KEY_PAGES];
+    load_pages(0, tile_lines, tile_keys);
     stage_tile(rotated_k, sK, 0, tile_keys);
-    stage_tile(p.v_pool, sV, 0, tile_lanes);
+    stage_tile(p.v_pool, sV, 0, tile_lines);
     __syncthreads();
 
     // Pass 1: online-softmax attention with per-(row,key) causal masking.
     for (int t = 0; t < n_key_tiles; ++t) {
         const int tile_base = t * KEY_TILE;
-        load_pages(t + 1, next_lanes, next_keys);
+        load_pages(t + 1, next_lines, next_keys);
         attn::cp_async_wait<1>();
         __syncthreads();
 
@@ -258,7 +258,7 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
 
         attn::tile_pv_registers<scalar_t, KEY_TILE, HEAD_DIM, BF16, NWARPS, true>(sP, sV, row_rescale, out_acc, warp);
         __syncthreads();
-        stage_tile(p.v_pool, sV, t + 1, next_lanes);
+        stage_tile(p.v_pool, sV, t + 1, next_lines);
     }
 
     // Normalize + write o, each lane over the accumulators it owns.
@@ -310,11 +310,11 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
     float* mass = seq_mass(p, s, ctx_len, PAGE_SIZE);
     // Only K is re-streamed here, so one tile is in flight and QKᵀ frees the shared
     // tile for the next one.
-    load_pages(0, tile_lanes, tile_keys);
+    load_pages(0, tile_lines, tile_keys);
     stage_tile(rotated_k, sK, 0, tile_keys);
     for (int t = 0; t < n_key_tiles; ++t) {
         const int tile_base = t * KEY_TILE;
-        load_pages(t + 1, next_lanes, next_keys);
+        load_pages(t + 1, next_lines, next_keys);
         attn::cp_async_wait<0>();
         __syncthreads();
 

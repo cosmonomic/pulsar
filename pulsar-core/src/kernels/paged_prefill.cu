@@ -38,8 +38,8 @@ rotate_view_keys_kernel(const attn::PagedAttnParams<scalar_t> p, int page_size, 
     const int pairs_per_key = p.n_kv_heads * half;
     const int64_t page_elems = static_cast<int64_t>(page_size) * p.n_kv_heads * p.head_dim;
     const attn::KeyLayout layout = attn::key_layout(p.rope_layout, s);
-    const int lane = p.page_tables[static_cast<int64_t>(s) * p.max_pages + view_page];
-    const scalar_t* src = p.k_pool + lane * page_elems;
+    const int line = p.page_tables[static_cast<int64_t>(s) * p.max_pages + view_page];
+    const scalar_t* src = p.k_pool + line * page_elems;
     scalar_t* dst = rotated_k + blockIdx.x * page_elems;
     for (int i = threadIdx.x; i < keys * pairs_per_key; i += blockDim.x) {
         const int off = i / pairs_per_key;

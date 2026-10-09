@@ -4,75 +4,86 @@
 
 #include <ATen/core/Tensor.h>
 
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
+#include <optional>
 #include <span>
 #include <unordered_map>
 #include <vector>
 
-#include "pulsar/ds/sparse_bitset.hpp"
+#include "pulsar/digest.hpp"
+#include "pulsar/event_loop.hpp"
 
 namespace pulsar {
 
-class kv_cache {
-  public:
-    using page_id = std::uint64_t;
-    using step = std::uint64_t;
-
-    struct write_run {
-        page_id page;
-        std::uint32_t offset;
-        std::uint32_t count;
-    };
-
-    struct batch_tables {
-        at::Tensor page_tables;  // int32 [num_views, max_pages]
-        at::Tensor cu_view_pages;  // int32 [num_views + 1]
-    };
-
-  private:
-    struct lane;
-
-    at::Tensor k;  // [n_layers, n_lanes, page_size, n_kv_heads, head_dim]
+struct page {
+    at::Tensor k;  // [n_layers, page_size, n_kv_heads, head_dim]
     at::Tensor v;
-    std::vector<lane> lanes;
-    std::unordered_map<page_id, std::uint32_t> lane_of;
+};
+
+// fetch returns the pages in the order of hashes, nullopt for those it does not have. put takes ownership of host
+// pages and their hashes, matched by index, and returns without waiting for the write.
+template <typename t>
+concept page_store = requires(t s, std::span<const digest> hashes, std::vector<digest> keys, std::vector<page> pages) {
+    { s.fetch(hashes) } -> std::same_as<task<std::vector<std::optional<page>>>>;
+    { s.put(std::move(keys), std::move(pages)) } -> std::same_as<void>;
+};
+
+enum class page_error { miss, oom };
+
+template <page_store t_store> class kv_cache {
+  private:
+    struct line;
+
+    at::Tensor k;  // [n_layers, n_lines, page_size, n_kv_heads, head_dim]
+    at::Tensor v;
+    // Indexed by line.
+    std::vector<line> lines;
+    std::unordered_map<digest, std::uint32_t, digest_hash> digest_to_line_id;
+    // Pages a get is fetching into a line, not yet in digest_to_line_id.
+    std::unordered_map<digest, std::uint32_t, digest_hash> fetching;
+    t_store store;
 
   public:
     kv_cache(
         std::size_t n_layers,
-        std::size_t n_lanes,
+        std::size_t n_lines,
         std::size_t page_size,
         std::size_t n_kv_heads,
         std::size_t head_dim,
         at::ScalarType dtype,
-        at::Device device
+        at::Device device,
+        t_store&& store
     );
 
-    step begin_step();
-    void end_step();
+    // Callers release lines only after the GPU work using them completes. get and allocate never wait for lines. A line
+    // is free when it is not held; free lines are reused least recently released first and their pages dropped. Without
+    // enough free lines the call fails with oom. A failed call holds nothing.
 
-    bool resident(page_id page) const noexcept;
-
-    // Assigns a lane to each page, reusing least recently used lanes not touched by an in-flight step. Returns the
-    // pages that lost their lane.
-    std::vector<page_id> claim(std::span<const page_id> pages);
-    void copy(page_id src, page_id dst);
-    // k, v: [n_layers, page_size, n_kv_heads, head_dim]; the step that reads the page waits for the copy.
-    void load(page_id page, const at::Tensor& k, const at::Tensor& v);
-    void drop(std::span<const page_id> pages) noexcept;
-
-    // Marks every referenced page as used by the current step.
-    batch_tables tables(std::span<const ds::sparse_bitset* const> views);
-    at::Tensor slots(std::span<const write_run> runs) const;
+    // Gives every page a line in the order of hashes, fetching the pages that are not resident from the store, and
+    // holds the lines until release. A page another get is fetching shares that line and fetch. Fails with miss when
+    // the store does not have a page.
+    task<std::expected<std::vector<std::uint32_t>, page_error>> get(std::span<const digest> hashes);
+    // Gives count empty pages and holds them until release. A page is not cached until mapped: get never finds it and
+    // its line is freed when released.
+    task<std::expected<std::vector<std::uint32_t>, page_error>> allocate(std::size_t count);
+    // Gives count unmapped lines holding a copy of the page at line_id, held until release.
+    task<std::expected<std::vector<std::uint32_t>, page_error>> clone(std::uint32_t line_id, std::size_t count);
+    // Caches the full page at each line under the hash at the same index, and puts a host copy of each into the store.
+    // Completes once the copies are handed to put.
+    task<void> map(std::span<const digest> hashes, std::span<const std::uint32_t> line_ids);
+    void release(std::span<const std::uint32_t> line_ids) noexcept;
 
     at::Tensor k_pool(std::size_t layer) const;
     at::Tensor v_pool(std::size_t layer) const;
 };
 
-struct kv_cache::lane {
-    page_id page;
-    step last_used;
+template <page_store t_store> struct kv_cache<t_store>::line {
+    std::optional<digest> hash;
+    std::uint64_t last_released;
+    std::uint32_t ref;
 };
 
 }  // namespace pulsar
